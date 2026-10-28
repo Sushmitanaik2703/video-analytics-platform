@@ -234,6 +234,12 @@ def process_frame(
     ] = []
 
     boxes = result.boxes
+    if args.debug_detections:
+        print(f"t={timestamp:.2f}s result.boxes is None: {boxes is None}")
+        print(
+            f"t={timestamp:.2f}s result.boxes.id is None: "
+            f"{boxes is None or boxes.id is None}"
+        )
     track_ids = (
         boxes.id.int().cpu().tolist()
         if boxes is not None and boxes.id is not None
