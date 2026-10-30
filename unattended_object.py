@@ -1,12 +1,18 @@
-import torch
 import argparse
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+try:
+    import winsound
+except ImportError:
+    winsound = None
 
 import cv2
+import torch
 from ultralytics import YOLO
 
 
@@ -14,6 +20,9 @@ PERSON_CLASS_ID = 0
 BAG_CLASS_IDS = {24, 26, 28}
 TRACKED_CLASS_IDS = [PERSON_CLASS_ID, *sorted(BAG_CLASS_IDS)]
 TRACK_EXPIRY_SECONDS = 2.0
+OCCLUSION_GRACE_SECONDS = 5.0
+MAX_CLASS_HISTORY = 30
+MIN_AREA_RATIO = 0.50
 
 
 def get_model_class_ids(model: YOLO) -> tuple[int, set[int], list[int]]:
@@ -54,6 +63,8 @@ class TrackedBag:
     last_alert_at: float | None = None
     alert_active: bool = False
     last_seen_time: float = 0.0
+    class_history: list[str] = field(default_factory=list)
+    anchor_id: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -175,10 +186,49 @@ def frame_timestamp(
     return timestamp
 
 
+def match_detection_to_anchor(
+    position: tuple[float, float],
+    bbox: tuple[int, int, int, int],
+    bags: dict[int, TrackedBag],
+    stationary_distance: float,
+    min_area_ratio: float = MIN_AREA_RATIO,
+) -> int | None:
+    det_w = max(1, bbox[2] - bbox[0])
+    det_h = max(1, bbox[3] - bbox[1])
+    det_area = float(det_w * det_h)
+
+    best_match_id = None
+    min_distance = float("inf")
+
+    for bag_id, bag in bags.items():
+        # Center-distance gate against the bag's stationary anchor
+        dist = (
+            (position[0] - bag.stationary_anchor[0]) ** 2
+            + (position[1] - bag.stationary_anchor[1]) ** 2
+        ) ** 0.5
+        if dist > stationary_distance:
+            continue
+
+        # Area-ratio gate
+        anchor_w = max(1, bag.bbox[2] - bag.bbox[0])
+        anchor_h = max(1, bag.bbox[3] - bag.bbox[1])
+        anchor_area = float(anchor_w * anchor_h)
+        area_ratio = min(det_area, anchor_area) / max(det_area, anchor_area)
+        if area_ratio < min_area_ratio:
+            continue
+
+        if dist < min_distance:
+            min_distance = dist
+            best_match_id = bag_id
+
+    return best_match_id
+
+
 def update_bag(
     bag: TrackedBag,
     bbox: tuple[int, int, int, int],
     position: tuple[float, float],
+    class_name: str,
     timestamp: float,
     person_distance: float,
     stationary_distance: float,
@@ -189,6 +239,13 @@ def update_bag(
     bag.last_detected_at = datetime.now()
     bag.last_seen_time = timestamp
 
+    # Update rolling class vote accumulator
+    bag.class_history.append(class_name)
+    if len(bag.class_history) > MAX_CLASS_HISTORY:
+        bag.class_history.pop(0)
+    bag.class_name = Counter(bag.class_history).most_common(1)[0][0]
+
+    # Evaluate physical displacement from stationary anchor
     movement = (
         (position[0] - bag.stationary_anchor[0]) ** 2
         + (position[1] - bag.stationary_anchor[1]) ** 2
@@ -198,6 +255,7 @@ def update_bag(
         bag.stationary_since = timestamp
         bag.alert_active = False
 
+    # Owner association: frozen once set; only associates if owner is currently unknown
     if bag.associated_person_id is None:
         nearby_people = [
             (
@@ -213,6 +271,17 @@ def update_bag(
         nearby_people = [item for item in nearby_people if item[0] <= person_distance]
         if nearby_people:
             bag.associated_person_id = min(nearby_people)[1]
+
+
+def play_alert_sound(frequency: int = 1500, duration_ms: int = 400) -> None:
+    """Non-blocking audio alert on Windows via winsound in a daemon thread."""
+    if winsound is not None:
+        def _beep():
+            try:
+                winsound.Beep(frequency, duration_ms)
+            except Exception:
+                pass
+        threading.Thread(target=_beep, daemon=True).start()
 
 
 def draw_box(
@@ -309,9 +378,43 @@ def process_frame(
                     continue
                 detected_bags.append((track_id, class_name, bbox, position))
 
+    # Spatial Luggage Anchoring: bridge temporary track ID drops across brief occlusions
+    # Each incoming detected bag is mapped either to an existing spatial anchor or assigned a new anchor
+    claimed_anchor_keys: set[int] = set()
+
     for track_id, class_name, bbox, position in detected_bags:
-        bag = bags.get(track_id)
-        if bag is None:
+        matched_anchor_key: int | None = None
+
+        # Case 1: Direct track ID match in active bags dictionary
+        if track_id in bags:
+            matched_anchor_key = track_id
+        else:
+            # Case 2: ByteTrack assigned a new track_id after occlusion/drop.
+            # Query the spatial anchor registry excluding anchors already claimed in this frame
+            available_anchors = {
+                k: v for k, v in bags.items() if k not in claimed_anchor_keys
+            }
+            matched_anchor_key = match_detection_to_anchor(
+                position,
+                bbox,
+                available_anchors,
+                stationary_distance=args.stationary_distance,
+                min_area_ratio=MIN_AREA_RATIO,
+            )
+
+        if matched_anchor_key is not None:
+            bag = bags[matched_anchor_key]
+            claimed_anchor_keys.add(matched_anchor_key)
+
+            # If the ByteTrack track ID changed, migrate key to current track_id
+            if matched_anchor_key != track_id:
+                del bags[matched_anchor_key]
+                bag.track_id = track_id
+                bags[track_id] = bag
+                claimed_anchor_keys.discard(matched_anchor_key)
+                claimed_anchor_keys.add(track_id)
+        else:
+            # Case 3: Completely new bag appearing at this location
             bag = TrackedBag(
                 track_id=track_id,
                 class_name=class_name,
@@ -322,20 +425,26 @@ def process_frame(
                 stationary_since=timestamp,
                 stationary_anchor=position,
                 last_seen_time=timestamp,
+                class_history=[class_name],
+                anchor_id=track_id,
             )
             bags[track_id] = bag
+            claimed_anchor_keys.add(track_id)
+
         update_bag(
             bag,
             bbox,
             position,
+            class_name,
             timestamp,
             args.person_distance,
             args.stationary_distance,
             people,
         )
 
+    # Prune anchors that have not been observed within OCCLUSION_GRACE_SECONDS (5.0s)
     for track_id in list(bags):
-        if timestamp - bags[track_id].last_seen_time > TRACK_EXPIRY_SECONDS:
+        if timestamp - bags[track_id].last_seen_time > OCCLUSION_GRACE_SECONDS:
             del bags[track_id]
 
     if not args.debug_detections:
@@ -395,6 +504,7 @@ def process_frame(
         ):
             bag.alert_active = True
             bag.last_alert_at = timestamp
+            play_alert_sound()
 
         warning_active = warning_active or bag.alert_active
         person_text = (
@@ -402,11 +512,18 @@ def process_frame(
             if bag.associated_person_id is not None
             else "person unknown"
         )
-        label = (
-            f"{bag.class_name} ID {bag.track_id} | "
-            f"{stationary_duration:.1f}s | "
-            f"pos ({int(bag.position[0])}, {int(bag.position[1])}) | {person_text}"
-        )
+        if bag.alert_active:
+            label = (
+                f"UNATTENDED BAG | ID: {bag.track_id} | "
+                f"{stationary_duration:.1f}s | "
+                f"pos ({int(bag.position[0])}, {int(bag.position[1])}) | {person_text}"
+            )
+        else:
+            label = (
+                f"{bag.class_name} ID {bag.track_id} | "
+                f"{stationary_duration:.1f}s | "
+                f"pos ({int(bag.position[0])}, {int(bag.position[1])}) | {person_text}"
+            )
         draw_box(
             frame,
             bag.bbox,
@@ -416,7 +533,7 @@ def process_frame(
         if bag.alert_active:
             cv2.putText(
                 frame,
-                "POSSIBLE UNATTENDED OBJECT",
+                "UNATTENDED OBJECT",
                 (bag.bbox[0], min(frame.shape[0] - 10, bag.bbox[3] + 24)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -425,13 +542,14 @@ def process_frame(
             )
 
     if warning_active:
+        cv2.rectangle(frame, (0, 0), (frame.shape[1], 45), (0, 0, 220), -1)
         cv2.putText(
             frame,
-            "POSSIBLE UNATTENDED OBJECT",
-            (20, 35),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 255),
+            "ALERT: UNATTENDED BAG DETECTED",
+            (20, 32),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.9,
+            (255, 255, 255),
             2,
         )
     return frame
