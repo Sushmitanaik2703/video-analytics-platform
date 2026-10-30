@@ -1,3 +1,4 @@
+import torch
 import argparse
 import sys
 import time
@@ -45,6 +46,12 @@ def parse_args() -> argparse.Namespace:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--video", type=Path, help="Path to a video file")
     source.add_argument("--webcam", action="store_true", help="Use the default webcam")
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=None,
+        help="Path to YOLO model checkpoint (default: yolov8s.pt if available, else yolov8n.pt)",
+    )
     parser.add_argument(
         "--confidence",
         type=float,
@@ -222,7 +229,7 @@ def process_frame(
         conf=inference_confidence,
         classes=None if args.debug_detections else TRACKED_CLASS_IDS,
         imgsz=args.imgsz,
-        device="cpu",
+        device=0 if torch.cuda.is_available() else "cpu",
         persist=True,
         tracker="bytetrack.yaml",
         verbose=False,
@@ -325,15 +332,39 @@ def process_frame(
     for bag in bags.values():
         stationary_duration = max(0.0, timestamp - bag.stationary_since)
         associated_person = people.get(bag.associated_person_id)
-        person_moved_away = (
-            associated_person is not None
-            and (
+        if associated_person is not None:
+            dist_to_owner = (
                 (associated_person.position[0] - bag.position[0]) ** 2
                 + (associated_person.position[1] - bag.position[1]) ** 2
+            ) ** 0.5
+            person_moved_away = dist_to_owner > args.person_distance
+        elif bag.associated_person_id is not None:
+            # Owner was previously identified but has now walked out of view/off-screen
+            # Verify no other person is currently standing directly beside the bag
+            min_dist_to_anyone = min(
+                [
+                    (
+                        (p.position[0] - bag.position[0]) ** 2
+                        + (p.position[1] - bag.position[1]) ** 2
+                    ) ** 0.5
+                    for p in people.values()
+                ],
+                default=float("inf"),
             )
-            ** 0.5
-            > args.person_distance
-        )
+            person_moved_away = min_dist_to_anyone > args.person_distance
+        else:
+            # Unclaimed bag standing alone with no associated person
+            min_dist_to_anyone = min(
+                [
+                    (
+                        (p.position[0] - bag.position[0]) ** 2
+                        + (p.position[1] - bag.position[1]) ** 2
+                    ) ** 0.5
+                    for p in people.values()
+                ],
+                default=float("inf"),
+            )
+            person_moved_away = min_dist_to_anyone > args.person_distance
         conditions_met = (
             stationary_duration >= args.stationary_time and person_moved_away
         )
@@ -389,7 +420,13 @@ def process_frame(
 
 def main() -> int:
     args = parse_args()
-    model_path = Path(__file__).resolve().parent / "yolov8n.pt"
+    if args.model is not None:
+        model_path = args.model.resolve()
+    else:
+        candidate_s = Path(__file__).resolve().parent / "yolov8s.pt"
+        candidate_n = Path(__file__).resolve().parent / "yolov8n.pt"
+        model_path = candidate_s if candidate_s.is_file() else candidate_n
+
     if not model_path.is_file():
         print(f"Error: YOLO model not found: {model_path}", file=sys.stderr)
         return 1

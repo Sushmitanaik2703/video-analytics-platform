@@ -13,6 +13,7 @@ venv/
 # Generated detection results
 runs/
 outputs/
+datasets/coco_subset/
 
 # Local test media
 bus.jpg
