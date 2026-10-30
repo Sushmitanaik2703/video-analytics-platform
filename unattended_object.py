@@ -16,6 +16,23 @@ TRACKED_CLASS_IDS = [PERSON_CLASS_ID, *sorted(BAG_CLASS_IDS)]
 TRACK_EXPIRY_SECONDS = 2.0
 
 
+def get_model_class_ids(model: YOLO) -> tuple[int, set[int], list[int]]:
+    names = model.names
+    person_id = 0
+    bag_ids = set()
+    for cid, cname in names.items():
+        if cname == "person":
+            person_id = int(cid)
+        elif cname in {"backpack", "handbag", "suitcase"}:
+            bag_ids.add(int(cid))
+    if not bag_ids:
+        # Fallback to standard COCO IDs
+        person_id = PERSON_CLASS_ID
+        bag_ids = BAG_CLASS_IDS
+    tracked_ids = [person_id, *sorted(bag_ids)]
+    return person_id, bag_ids, tracked_ids
+
+
 @dataclass
 class TrackedPerson:
     track_id: int
@@ -68,7 +85,8 @@ def parse_args() -> argparse.Namespace:
         "--imgsz",
         type=int,
         default=640,
-        help="YOLO inference image size; larger values help small bags but run slower (default: 640)",
+        choices=[640, 1280],
+        help="YOLO inference image size: 640 (default) or 1280 (high-resolution)",
     )
     parser.add_argument(
         "--stationary-time",
@@ -115,8 +133,8 @@ def parse_args() -> argparse.Namespace:
     for option in ("confidence", "bag_confidence"):
         if not 0 <= getattr(args, option) <= 1:
             parser.error(f"--{option.replace('_', '-')} must be between 0 and 1")
-    if args.imgsz < 32:
-        parser.error("--imgsz must be at least 32")
+    if args.imgsz not in (640, 1280):
+        parser.error(f"--imgsz must be either 640 or 1280, got {args.imgsz}")
     for option in (
         "stationary_time",
         "person_distance",
@@ -223,11 +241,12 @@ def process_frame(
     args: argparse.Namespace,
     timestamp: float,
 ) -> object:
+    person_cls_id, bag_cls_ids, tracked_cls_ids = get_model_class_ids(model)
     inference_confidence = min(args.confidence, args.bag_confidence)
     results = model.track(
         frame,
         conf=inference_confidence,
-        classes=None if args.debug_detections else TRACKED_CLASS_IDS,
+        classes=None if args.debug_detections else tracked_cls_ids,
         imgsz=args.imgsz,
         device=0 if torch.cuda.is_available() else "cpu",
         persist=True,
@@ -272,13 +291,13 @@ def process_frame(
                     (255, 255, 0),
                 )
 
-            if class_id == PERSON_CLASS_ID and confidence >= args.confidence:
+            if class_id == person_cls_id and confidence >= args.confidence:
                 if track_id is None:
                     if not args.debug_detections:
                         draw_box(frame, bbox, "person | ID unavailable", (255, 180, 0))
                     continue
                 people[track_id] = TrackedPerson(track_id, position, bbox)
-            elif class_id in BAG_CLASS_IDS and confidence >= args.bag_confidence:
+            elif class_id in bag_cls_ids and confidence >= args.bag_confidence:
                 if track_id is None:
                     if not args.debug_detections:
                         draw_box(
