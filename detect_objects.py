@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--confidence",
         type=float,
-        default=0.50,
+        default=0.35,
         help="Minimum detection confidence (default: 0.50)",
     )
 
@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    model_path = Path(__file__).resolve().parent / "yolov8n.pt"
+    model_path = Path(__file__).resolve().parent / "yolov8s.pt"
 
     if not model_path.is_file():
         print(f"Error: YOLO model not found: {model_path}", file=sys.stderr)
@@ -104,7 +104,13 @@ def main() -> int:
                     print(f"Error: Could not open detections file {detections_output_path}: {error}", file=sys.stderr)
                     return 1
 
-            results = model(frame, conf=args.confidence, device="cpu", verbose=False)
+            results = model(
+    frame,
+    conf=args.confidence,
+    classes=[0, 24, 26, 28],
+    device="cpu",
+    verbose=False
+)
             result = results[0]
             annotated_frame = result.plot()
             writer.write(annotated_frame)
