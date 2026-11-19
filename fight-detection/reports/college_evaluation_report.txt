@@ -1,0 +1,17 @@
+COLLEGE VIDEO EVALUATION REPORT
+Dataset: 3 staged Fight + 7 NonFight videos
+Note: Small exploratory test; not a benchmark.
+
+===== Original MODEL =====
+Accuracy: 30.00%
+Fight Precision: 30.00%
+Fight Recall: 100.00%
+NonFight Recall: 0.00%
+TP: 3, TN: 0, FP: 7, FN: 0
+
+===== Augmented MODEL =====
+Accuracy: 60.00%
+Fight Precision: 33.33%
+Fight Recall: 33.33%
+NonFight Recall: 71.43%
+TP: 1, TN: 5, FP: 2, FN: 2

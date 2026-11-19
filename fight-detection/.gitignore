@@ -1,0 +1,18 @@
+# Python environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Datasets and videos
+dataset/
+sample_videos/
+*.mp4
+*.avi
+*.mov
+*.zip
+
+# Temporary files
+*.log
+.ipynb_checkpoints/
+.DS_Store

@@ -1,0 +1,11 @@
+Video,Actual,Original Prediction,Original Fight Probability (%),Augmented Prediction,Augmented Fight Probability (%)
+college_fight_01.mp4,Fight,Fight,69.71,NonFight,48.02
+college_fight_02.mp4,Fight,Fight,74.11,Fight,53.38
+college_fight_03.mp4,Fight,Fight,72.79,NonFight,34.8
+college_normal_01.mp4,NonFight,Fight,73.94,Fight,65.56
+college_normal_02.mp4,NonFight,Fight,68.82,NonFight,42.02
+college_normal_03.mp4,NonFight,Fight,67.63,NonFight,43.75
+unattended_01.mp4,NonFight,Fight,68.83,NonFight,33.38
+unattended_02.mp4,NonFight,Fight,74.7,NonFight,27.35
+unattended_03.mp4,NonFight,Fight,74.44,NonFight,33.1
+unattended_04.mp4,NonFight,Fight,68.11,Fight,62.97
