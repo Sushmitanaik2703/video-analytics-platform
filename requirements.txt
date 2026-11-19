@@ -1,3 +1,8 @@
+
 ultralytics==8.4.190
 opencv-python==5.0.0.93
 lap>=0.5.12
+torch
+torchvision
+numpy
+Pillow
