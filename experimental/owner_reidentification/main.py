@@ -101,6 +101,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory to save key event screenshots",
     )
+    parser.add_argument(
+        "--realtime",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Synchronize playback to original video speed (default: True, use --no-realtime for uncapped)",
+    )
     return parser.parse_args()
 
 
@@ -236,12 +242,33 @@ def main() -> int:
             if writer is not None:
                 writer.write(annotated_frame)
 
-# Display annotated video
-            # Fast live display without artificial framerate throttle
+            # Display annotated video at original video playback speed
             cv2.imshow("Smart CCTV - Owner Re-Identification", annotated_frame)
-            key = cv2.waitKey(1) & 0xFF
 
-# Press Q to exit
+            if args.realtime:
+                frame_interval = 1.0 / fps
+                target_next_time = start_wall_time + (frame_idx + 1) * frame_interval
+                time_remaining = target_next_time - time.time()
+
+                if time_remaining > 0:
+                    # Processing was faster than frame duration: wait remaining time to match original video speed
+                    wait_ms = max(1, int(time_remaining * 1000))
+                    key = cv2.waitKey(wait_ms) & 0xFF
+                else:
+                    # Processing took longer: minimal UI wait and catch up with real-time clock
+                    key = cv2.waitKey(1) & 0xFF
+                    lag = time.time() - target_next_time
+                    if lag > frame_interval:
+                        # Skip intermediate frames to prevent slow-motion playback lag
+                        skip_count = min(int(lag / frame_interval), 2)
+                        for _ in range(skip_count):
+                            if not capture.grab():
+                                break
+                            frame_idx += 1
+            else:
+                key = cv2.waitKey(1) & 0xFF
+
+            # Press Q to exit
             if key == ord('q'):
                 break
 
