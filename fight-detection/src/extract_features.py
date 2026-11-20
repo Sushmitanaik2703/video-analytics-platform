@@ -1,3 +1,4 @@
+
 import cv2
 import numpy as np
 import os
@@ -109,67 +110,71 @@ def extract_video_features(video_path):
     }
 
 
-all_features = []
+# Dataset processing runs only when this file is executed directly.
+# Importing extract_video_features() will not process the dataset.
 
-categories = {
-    "Fight": 1,
-    "NonFight": 0
-}
+if __name__ == "__main__":
 
-for category, label in categories.items():
+    all_features = []
 
-    folder = os.path.join(DATASET_PATH, category)
+    categories = {
+        "Fight": 1,
+        "NonFight": 0
+    }
 
-    videos = [
-        file for file in os.listdir(folder)
-        if file.lower().endswith(".mp4")
+    for category, label in categories.items():
+
+        folder = os.path.join(DATASET_PATH, category)
+
+        videos = [
+            file for file in os.listdir(folder)
+            if file.lower().endswith(".mp4")
+        ]
+
+        print(f"\nProcessing {category} videos...")
+
+        for video in tqdm(videos):
+
+            video_path = os.path.join(folder, video)
+
+            features = extract_video_features(video_path)
+
+            if features is not None:
+
+                features["video_name"] = video
+                features["label"] = label
+
+                all_features.append(features)
+
+            else:
+                print(f"Could not process: {video}")
+
+    df = pd.DataFrame(all_features)
+
+    columns = [
+        "video_name",
+        "mean_motion",
+        "max_motion",
+        "std_motion",
+        "mean_horizontal",
+        "mean_vertical",
+        "motion_variation",
+        "motion_energy",
+        "high_motion_ratio",
+        "median_motion",
+        "min_motion",
+        "label"
     ]
 
-    print(f"\nProcessing {category} videos...")
+    df = df[columns]
 
-    for video in tqdm(videos):
+    os.makedirs("features", exist_ok=True)
 
-        video_path = os.path.join(folder, video)
+    df.to_csv(OUTPUT_FILE, index=False)
 
-        features = extract_video_features(video_path)
-
-        if features is not None:
-
-            features["video_name"] = video
-            features["label"] = label
-
-            all_features.append(features)
-
-        else:
-            print(f"Could not process: {video}")
-
-
-df = pd.DataFrame(all_features)
-
-columns = [
-    "video_name",
-    "mean_motion",
-    "max_motion",
-    "std_motion",
-    "mean_horizontal",
-    "mean_vertical",
-    "motion_variation",
-    "motion_energy",
-    "high_motion_ratio",
-    "median_motion",
-    "min_motion",
-    "label"
-]
-
-df = df[columns]
-
-os.makedirs("features", exist_ok=True)
-
-df.to_csv(OUTPUT_FILE, index=False)
-
-print("\nImproved feature extraction completed!")
-print("Total processed videos:", len(df))
-print("Fight videos:", len(df[df["label"] == 1]))
-print("NonFight videos:", len(df[df["label"] == 0]))
-print("Total features:", len(columns) - 2)
-print("Saved to:", OUTPUT_FILE)
+    print("\nImproved feature extraction completed!")
+    print("Total processed videos:", len(df))
+    print("Fight videos:", len(df[df["label"] == 1]))
+    print("NonFight videos:", len(df[df["label"] == 0]))
+    print("Total features:", len(columns) - 2)
+    print("Saved to:", OUTPUT_FILE)
