@@ -84,11 +84,12 @@ class SmartCCTVApp:
         # Execution State
         self.is_processing = False
         self.stop_event = threading.Event()
-        self.ui_queue: queue.Queue = queue.Queue(maxsize=15)
+        self.ui_queue: queue.Queue = queue.Queue(maxsize=2)
         self.last_results: dict | None = None
         self.annotated_video_path: Path | None = None
         self.saved_screenshots: list[str] = []
         self.last_ui_draw_time = 0.0
+        self._incident_table_signature: tuple | None = None
 
         # Build UI Components
         self._build_header()
@@ -964,7 +965,7 @@ class SmartCCTVApp:
         self.notebook.select(self.tab_monitor)
 
         # Start thread-safe UI poll loop on main thread
-        self.root.after(25, self._poll_ui_queue)
+        self.root.after(1, self._poll_ui_queue)
 
         thread = threading.Thread(
             target=self._run_pipeline_thread,
@@ -978,36 +979,33 @@ class SmartCCTVApp:
         thread.start()
 
     def _poll_ui_queue(self):
-        latest_frame_data = None
-
-        while not self.ui_queue.empty():
-            try:
-                msg_type, payload = self.ui_queue.get_nowait()
-                if msg_type == "FRAME":
-                    latest_frame_data = payload
-                elif msg_type == "COMPLETED":
-                    results, out_video_path = payload
-                    self._on_pipeline_completed(results, out_video_path)
-                    return
-                elif msg_type == "ERROR":
-                    self._on_pipeline_error(payload)
-                    return
-            except queue.Empty:
-                break
-
-        if latest_frame_data is not None:
-            self._update_live_ui(
-                latest_frame_data["frame_idx"],
-                latest_frame_data["total_frames"],
-                latest_frame_data["fps"],
-                latest_frame_data["timestamp"],
-                latest_frame_data["status"],
-                latest_frame_data["annotated_frame"],
-                latest_frame_data["incident_history"],
-            )
+        try:
+            msg_type, payload = self.ui_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            if msg_type == "COMPLETED":
+                results, out_video_path = payload
+                self._on_pipeline_completed(results, out_video_path)
+                return
+            if msg_type == "ERROR":
+                self._on_pipeline_error(payload)
+                return
+            if msg_type == "FRAME":
+                latest_frame_data = payload
+                self._update_live_ui(
+                    latest_frame_data["frame_idx"],
+                    latest_frame_data["total_frames"],
+                    latest_frame_data["fps"],
+                    latest_frame_data["timestamp"],
+                    latest_frame_data["status"],
+                    latest_frame_data["annotated_frame"],
+                    latest_frame_data["incident_history"],
+                )
 
         if self.is_processing or not self.ui_queue.empty():
-            self.root.after(25, self._poll_ui_queue)
+            poll_interval_ms = max(1, int(1000 / max(float(self.fps), 1.0)))
+            self.root.after(poll_interval_ms, self._poll_ui_queue)
 
     def on_stop_detection(self):
         if self.is_processing:
@@ -1053,8 +1051,6 @@ class SmartCCTVApp:
                 camera_name=f"{self.video_path.stem.replace('_', ' ').title()} CCTV",
             )
 
-            last_push_time = [0.0]
-            last_incident_count = [0]
             last_terminal_print_time = [0.0]
 
             def progress_cb(data):
@@ -1067,10 +1063,7 @@ class SmartCCTVApp:
 
                 now = time.time()
                 has_new_alerts = len(status.get("notifications", [])) > 0 or status.get("all_active_alerts", 0) > 0
-                incidents_snapshot = list(pipeline.get_incident_history())
-                has_new_incidents = len(incidents_snapshot) > last_incident_count[0]
-                if has_new_incidents:
-                    last_incident_count[0] = len(incidents_snapshot)
+                incidents_snapshot = data["incident_history"]
 
                 # Terminal frame-by-frame playback logging (every 1s or on alert)
                 mins = int(cur_ts) // 60
@@ -1090,32 +1083,16 @@ class SmartCCTVApp:
                     last_terminal_print_time[0] = now
                     print(f"  [VIDEO {time_disp}] Frame {f_idx:5d}/{tot} | {cur_fps:.1f} FPS | Incidents: {len(incidents_snapshot)} | Status: Normal", flush=True)
 
-                # Throttle queue dispatch to ~30 FPS or immediately on new alert/incident
-                if has_new_alerts or has_new_incidents or (now - last_push_time[0] >= 0.033):
-                    last_push_time[0] = now
-                    frame_copy = annotated_frame.copy()
-                    incidents_snapshot = list(pipeline.get_incident_history())
-
-                    payload = {
-                        "frame_idx": f_idx,
-                        "total_frames": tot,
-                        "fps": cur_fps,
-                        "timestamp": cur_ts,
-                        "status": status,
-                        "annotated_frame": frame_copy,
-                        "incident_history": incidents_snapshot,
-                    }
-                    try:
-                        self.ui_queue.put_nowait(("FRAME", payload))
-                    except queue.Full:
-                        try:
-                            self.ui_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                        try:
-                            self.ui_queue.put_nowait(("FRAME", payload))
-                        except queue.Full:
-                            pass
+                payload = {
+                    "frame_idx": f_idx,
+                    "total_frames": tot,
+                    "fps": cur_fps,
+                    "timestamp": cur_ts,
+                    "status": status,
+                    "annotated_frame": annotated_frame,
+                    "incident_history": incidents_snapshot,
+                }
+                self.ui_queue.put(("FRAME", payload))
 
             results = process_integrated_stream(
                 video_source=str(self.video_path),
@@ -1124,6 +1101,7 @@ class SmartCCTVApp:
                 save_screenshots=screens_dir,
                 progress_callback=progress_cb,
                 stop_event=self.stop_event,
+                realtime_playback=True,
             )
 
             self.ui_queue.put(("COMPLETED", (results, out_video_path)))
@@ -1230,7 +1208,23 @@ class SmartCCTVApp:
             self.notif_panel.config(bg="#1a1d24")
 
         # 6. Live Incidents Table Synchronization
-        self._sync_incident_table(incident_history)
+        incident_signature = tuple(
+            (
+                incident.get("incident_id"),
+                incident.get("type"),
+                incident.get("track_id"),
+                incident.get("class_name"),
+                incident.get("zone_name"),
+                incident.get("entry_time"),
+                incident.get("exit_time"),
+                incident.get("duration_seconds"),
+                incident.get("status"),
+            )
+            for incident in incident_history
+        )
+        if incident_signature != self._incident_table_signature:
+            self._sync_incident_table(incident_history)
+            self._incident_table_signature = incident_signature
 
     def _display_frame_on_canvas(self, frame_bgr: np.ndarray):
         canvas_w = self.canvas.winfo_width()
@@ -1311,6 +1305,7 @@ class SmartCCTVApp:
                 self.tree_audit.insert("", "end", values=vals)
 
     def _clear_incident_table(self):
+        self._incident_table_signature = None
         for item in self.tree.get_children():
             self.tree.delete(item)
         for item in self.tree_audit.get_children():

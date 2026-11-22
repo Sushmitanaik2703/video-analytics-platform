@@ -39,6 +39,14 @@ import torch
 from ultralytics import YOLO
 
 
+def format_video_timestamp(timestamp: float) -> str:
+    """Format elapsed media time as HH:MM:SS without wrapping after 24 hours."""
+    total_seconds = max(0, int(timestamp + 0.5))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 @dataclass
 class RestrictedZone:
     """Represents a single restricted zone boundary."""
@@ -268,13 +276,19 @@ class IntrusionDetector:
         frame_w: int,
         frame_h: int,
         timestamp: float,
+        live_camera: bool = False,
     ) -> dict:
         """
         Evaluate intrusion rules on pre-tracked objects.
         Each item in `tracks`:
           {'track_id': int, 'class_name': str, 'bbox': (x1, y1, x2, y2), 'conf': float}
         """
-        time_mode, current_time_str = self.get_current_time_mode(timestamp)
+        time_mode, _ = self.get_current_time_mode(timestamp)
+        current_time_str = (
+            datetime.datetime.now().strftime("%H:%M:%S")
+            if live_camera
+            else format_video_timestamp(timestamp)
+        )
         active_track_zone_keys = set()
         confirmed_intruders: list[IntruderTrack] = []
         any_confirmed_intrusion = False
@@ -428,12 +442,16 @@ class IntrusionDetector:
                                 intruder.alert_level = "CRITICAL"
                                 intruder.alert_type = "PERSON_INTRUSION"
                             if not intruder.entry_logged:
+                                entry_time_str = (
+                                    intruder.first_detected_time_str
+                                    or current_time_str
+                                )
                                 alert_msg = (
                                     f"\n[CRITICAL ALERT] PERSON INTRUSION\n"
                                     f"Camera: {self.camera_name}\n"
                                     f"Track ID: {track_id}\n"
                                     f"Class: Person\n"
-                                    f"Entry Time: {current_time_str}\n"
+                                    f"Entry Time: {entry_time_str}\n"
                                 )
                                 print(alert_msg, flush=True)
                                 intruder.entry_logged = True
@@ -444,8 +462,8 @@ class IntrusionDetector:
                                     "class_name": "person",
                                     "zone_name": zone.name,
                                     "timestamp": timestamp,
-                                    "time_str": current_time_str,
-                                    "message": f"[RESTRICTED ZONE PERSON INTRUSION] Critical Red Alert! Person ID {track_id} entered '{zone.name}' at {current_time_str} (t={timestamp:.2f}s).",
+                                    "time_str": entry_time_str,
+                                    "message": f"[RESTRICTED ZONE PERSON INTRUSION] Critical Red Alert! Person ID {track_id} entered '{zone.name}' at {entry_time_str} (t={intruder.first_detected_time:.2f}s).",
                                 }
                                 new_notifications.append(notif)
                                 self.event_log.append(notif)
@@ -457,8 +475,8 @@ class IntrusionDetector:
                                     "track_id": track_id,
                                     "class_name": "person",
                                     "zone_name": zone.name,
-                                    "entry_time": current_time_str,
-                                    "entry_timestamp": timestamp,
+                                    "entry_time": entry_time_str,
+                                    "entry_timestamp": intruder.first_detected_time,
                                     "exit_time": None,
                                     "exit_timestamp": None,
                                     "duration_seconds": None,
@@ -470,12 +488,16 @@ class IntrusionDetector:
                                 intruder.alert_level = "CRITICAL"
                                 intruder.alert_type = "VEHICLE_INTRUSION"
                             if not intruder.entry_logged:
+                                entry_time_str = (
+                                    intruder.first_detected_time_str
+                                    or current_time_str
+                                )
                                 alert_msg = (
                                     f"\n[CRITICAL ALERT] VEHICLE INTRUSION\n"
                                     f"Camera: {self.camera_name}\n"
                                     f"Track ID: {track_id}\n"
                                     f"Class: {class_name.capitalize()}\n"
-                                    f"Entry Time: {current_time_str}\n"
+                                    f"Entry Time: {entry_time_str}\n"
                                 )
                                 print(alert_msg, flush=True)
                                 intruder.entry_logged = True
@@ -486,8 +508,8 @@ class IntrusionDetector:
                                     "class_name": class_name,
                                     "zone_name": zone.name,
                                     "timestamp": timestamp,
-                                    "time_str": current_time_str,
-                                    "message": f"[RESTRICTED ZONE VEHICLE INTRUSION] Critical Red Alert! Vehicle ID {track_id} entered '{zone.name}' at {current_time_str} (t={timestamp:.2f}s).",
+                                    "time_str": entry_time_str,
+                                    "message": f"[RESTRICTED ZONE VEHICLE INTRUSION] Critical Red Alert! Vehicle ID {track_id} entered '{zone.name}' at {entry_time_str} (t={intruder.first_detected_time:.2f}s).",
                                 }
                                 new_notifications.append(notif)
                                 self.event_log.append(notif)
@@ -499,8 +521,8 @@ class IntrusionDetector:
                                     "track_id": track_id,
                                     "class_name": class_name,
                                     "zone_name": zone.name,
-                                    "entry_time": current_time_str,
-                                    "entry_timestamp": timestamp,
+                                    "entry_time": entry_time_str,
+                                    "entry_timestamp": intruder.first_detected_time,
                                     "exit_time": None,
                                     "exit_timestamp": None,
                                     "duration_seconds": None,
@@ -513,9 +535,14 @@ class IntrusionDetector:
                             any_confirmed_intrusion = True
 
         # Helper for logging confirmed zone exit
-        def _record_zone_exit(intruder_obj: IntruderTrack, exit_t: float, exit_t_str: str):
+        def _record_zone_exit(intruder_obj: IntruderTrack, exit_t: float):
             if intruder_obj.confirmed and not intruder_obj.exit_logged:
                 intruder_obj.exit_logged = True
+                exit_t_str = (
+                    datetime.datetime.now().strftime("%H:%M:%S")
+                    if live_camera
+                    else format_video_timestamp(exit_t)
+                )
                 cat = "PERSON" if intruder_obj.class_name == "person" else "VEHICLE"
                 dur = max(1, int(round(exit_t - intruder_obj.first_detected_time)))
                 ent_str = intruder_obj.first_detected_time_str or exit_t_str
@@ -571,7 +598,7 @@ class IntrusionDetector:
                 # Confirmed physical exit:
                 # The entity was actively detected in this frame, but its contact point is outside this zone.
                 # Clear active intrusion state immediately so re-entry requires full confirmation.
-                _record_zone_exit(intruder, timestamp, current_time_str)
+                _record_zone_exit(intruder, timestamp)
                 del self.tracked_intruders[key]
             else:
                 # Temporary detection loss:
@@ -583,7 +610,7 @@ class IntrusionDetector:
                 )
                 if intruder.lost_frames > self.max_lost_frames and not keep_vehicle_alert:
                     # Grace period expired: entity disappeared from camera view
-                    _record_zone_exit(intruder, intruder.last_detected_time, current_time_str)
+                    _record_zone_exit(intruder, intruder.last_detected_time)
                     del self.tracked_intruders[key]
                 else:
                     # Preserve active state during missed detections; only an observed exit clears it.
@@ -621,6 +648,7 @@ class IntrusionDetector:
         self,
         frame: np.ndarray,
         timestamp: float,
+        live_camera: bool = False,
     ) -> tuple[np.ndarray, dict]:
         """
         Standalone frame processing with integrated YOLOv8 + ByteTrack.
@@ -686,7 +714,13 @@ class IntrusionDetector:
                     "conf": conf,
                 })
 
-        status = self.process_tracks(tracks, frame_w, frame_h, timestamp)
+        status = self.process_tracks(
+            tracks,
+            frame_w,
+            frame_h,
+            timestamp,
+            live_camera=live_camera,
+        )
         status["all_frame_tracks"] = tracks
         annotated_frame = self.annotate_frame(frame.copy(), status)
         return annotated_frame, status
@@ -1074,7 +1108,10 @@ def process_video_stream(
         print(f"Error: Could not open {source_desc}", file=sys.stderr)
         return {}
 
-    fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
+    is_live_camera = isinstance(video_source, int)
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    if not np.isfinite(fps) or fps <= 0:
+        fps = 25.0
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) if not isinstance(video_source, int) else 0
@@ -1094,6 +1131,7 @@ def process_video_stream(
 
     frame_idx = 0
     start_wall_time = time.time()
+    start_perf_time = time.perf_counter()
     saved_intruder_ids = set()
     saved_screenshot_paths: list[str] = []
 
@@ -1107,10 +1145,24 @@ def process_video_stream(
             if not ret:
                 break
 
-            msec = capture.get(cv2.CAP_PROP_POS_MSEC)
-            timestamp = msec / 1000.0 if msec > 0 else frame_idx / fps
+            if is_live_camera:
+                timestamp = time.perf_counter() - start_perf_time
+            else:
+                msec = capture.get(cv2.CAP_PROP_POS_MSEC)
+                timestamp = (
+                    msec / 1000.0
+                    if msec > 0 or frame_idx == 0
+                    else frame_idx / fps
+                )
 
-            annotated_frame, status = detector.process_frame(frame, timestamp)
+            if is_live_camera:
+                annotated_frame, status = detector.process_frame(
+                    frame,
+                    timestamp,
+                    live_camera=True,
+                )
+            else:
+                annotated_frame, status = detector.process_frame(frame, timestamp)
 
             # Screenshot on confirmed intrusion events or warnings
             if screens_dir is not None:
@@ -1164,23 +1216,21 @@ def process_video_stream(
             if display:
                 cv2.imshow("Smart CCTV - Restricted-Zone Intrusion Detection", annotated_frame)
 
-            if realtime and not isinstance(video_source, int):
+            if realtime and not is_live_camera:
                 frame_interval = 1.0 / fps
-                target_next_time = start_wall_time + (frame_idx + 1) * frame_interval
-                time_remaining = target_next_time - time.time()
+                target_next_time = start_perf_time + (frame_idx + 1) * frame_interval
+                time_remaining = target_next_time - time.perf_counter()
 
-                if time_remaining > 0:
-                    wait_ms = max(1, int(time_remaining * 1000))
-                    key = cv2.waitKey(wait_ms) & 0xFF if display else ord(" ")
+                if display:
+                    wait_ms = max(1, int(time_remaining * 1000)) if time_remaining > 0 else 1
+                    key = cv2.waitKey(wait_ms) & 0xFF
                 else:
-                    key = cv2.waitKey(1) & 0xFF if display else ord(" ")
-                    lag = time.time() - target_next_time
-                    if lag > frame_interval:
-                        skips = min(int(lag / frame_interval), 2)
-                        for _ in range(skips):
-                            if not capture.grab():
-                                break
-                            frame_idx += 1
+                    if time_remaining > 0:
+                        if stop_event is not None and hasattr(stop_event, "wait"):
+                            stop_event.wait(time_remaining)
+                        else:
+                            time.sleep(time_remaining)
+                    key = ord(" ")
             else:
                 key = cv2.waitKey(1) & 0xFF if display else ord(" ")
 

@@ -26,7 +26,11 @@ import torch
 from ultralytics import YOLO
 
 # Import unmodified original modules
-from intrusion_detection import IntrusionDetector, RestrictedZone
+from intrusion_detection import (
+    IntrusionDetector,
+    RestrictedZone,
+    format_video_timestamp,
+)
 from vehicle_tracking import VehicleTracker
 import unattended_object as uo
 
@@ -109,13 +113,22 @@ class IntegratedPipeline:
         if self.enable_unattended_bag:
             self.yolo_bag_model = YOLO(str(yolo_model_path))
 
-    def process_frame(self, frame: np.ndarray, timestamp: float) -> tuple[np.ndarray, dict]:
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        timestamp: float,
+        live_camera: bool = False,
+    ) -> tuple[np.ndarray, dict]:
         """
         Process a single video frame through all active feature modules.
         Returns the annotated frame and consolidated status dictionary.
         """
         annotated = frame.copy()
-        current_time_str = datetime.datetime.now().strftime("%H:%M:%S")
+        current_time_str = (
+            datetime.datetime.now().strftime("%H:%M:%S")
+            if live_camera
+            else format_video_timestamp(timestamp)
+        )
 
         status: dict = {
             "timestamp": timestamp,
@@ -133,7 +146,11 @@ class IntegratedPipeline:
 
         # ------------------- 1. RESTRICTED-ZONE INTRUSION -------------------
         if self.enable_intrusion and self.intrusion_detector is not None:
-            annotated, int_status = self.intrusion_detector.process_frame(annotated, timestamp)
+            annotated, int_status = self.intrusion_detector.process_frame(
+                annotated,
+                timestamp,
+                live_camera=live_camera,
+            )
             status["notifications"].extend(int_status.get("notifications", []))
             status["confirmed_intruders"] = int_status.get("confirmed_intruders", [])
 
@@ -154,12 +171,18 @@ class IntegratedPipeline:
                 if not any(x.get("incident_id") == inc.get("incident_id") and x.get("type") == inc.get("type") for x in self.incident_history):
                     self.incident_history.append(inc)
                 else:
-                    # Update status, exit time, duration for cleared incidents
+                    # Keep media timestamps and resolution data in the master record.
                     for x in self.incident_history:
                         if x.get("incident_id") == inc.get("incident_id") and x.get("type") == inc.get("type"):
-                            x["status"] = inc.get("status")
-                            x["exit_time"] = inc.get("exit_time")
-                            x["duration_seconds"] = inc.get("duration_seconds")
+                            for field in (
+                                "entry_time",
+                                "entry_timestamp",
+                                "exit_time",
+                                "exit_timestamp",
+                                "duration_seconds",
+                                "status",
+                            ):
+                                x[field] = inc.get(field)
 
         # ------------------- 2. STANDALONE VEHICLE TRACKING -------------------
         elif self.enable_vehicle_tracking and self.vehicle_tracker is not None:
@@ -323,6 +346,7 @@ def process_integrated_stream(
     save_screenshots: Path | str | None = None,
     progress_callback: Callable[[dict], None] | None = None,
     stop_event: threading.Event | None = None,
+    realtime_playback: bool = False,
 ) -> dict:
     """
     Execute integrated multi-feature detection pipeline over a video stream.
@@ -334,10 +358,13 @@ def process_integrated_stream(
         print(f"Error: Could not open {source_desc}", file=sys.stderr)
         return {}
 
-    fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
+    is_live_camera = isinstance(video_source, int)
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    if not np.isfinite(fps) or fps <= 0:
+        fps = 25.0
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) if not isinstance(video_source, int) else 0
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_live_camera else 0
 
     print(f"[Integrated Video] {source_desc}: {width}x{height} @ {fps:.1f} FPS ({total_frames} frames)")
     print(f"[Integrated Video] Intrusion: {pipeline.enable_intrusion} | Vehicles: {pipeline.enable_vehicle_tracking} | Unattended Bags: {pipeline.enable_unattended_bag}")
@@ -354,7 +381,8 @@ def process_integrated_stream(
         screens_dir.mkdir(parents=True, exist_ok=True)
 
     frame_idx = 0
-    start_wall_time = time.time()
+    start_perf_time = time.perf_counter()
+    live_start_time = start_perf_time
     saved_alert_keys = set()
     saved_screenshot_paths: list[str] = []
     last_terminal_time = 0.0
@@ -369,10 +397,24 @@ def process_integrated_stream(
             if not ret:
                 break
 
-            msec = capture.get(cv2.CAP_PROP_POS_MSEC)
-            timestamp = msec / 1000.0 if msec > 0 else frame_idx / fps
+            if is_live_camera:
+                timestamp = time.perf_counter() - live_start_time
+            else:
+                msec = capture.get(cv2.CAP_PROP_POS_MSEC)
+                timestamp = (
+                    msec / 1000.0
+                    if msec > 0 or frame_idx == 0
+                    else frame_idx / fps
+                )
 
-            annotated_frame, status = pipeline.process_frame(frame, timestamp)
+            if is_live_camera:
+                annotated_frame, status = pipeline.process_frame(
+                    frame,
+                    timestamp,
+                    live_camera=True,
+                )
+            else:
+                annotated_frame, status = pipeline.process_frame(frame, timestamp)
 
             # Terminal playback + alert logging
             now_wall = time.time()
@@ -418,7 +460,7 @@ def process_integrated_stream(
                 writer.write(annotated_frame)
 
             if progress_callback is not None:
-                elapsed_now = time.time() - start_wall_time
+                elapsed_now = time.perf_counter() - start_perf_time
                 fps_now = frame_idx / elapsed_now if elapsed_now > 0 else 0.0
                 try:
                     progress_callback({
@@ -433,14 +475,25 @@ def process_integrated_stream(
                 except Exception:
                     pass
 
+            if realtime_playback and not is_live_camera:
+                next_frame_time = start_perf_time + (frame_idx + 1) / fps
+                wait_seconds = next_frame_time - time.perf_counter()
+                if wait_seconds > 0:
+                    if stop_event is not None:
+                        stop_event.wait(wait_seconds)
+                    else:
+                        time.sleep(wait_seconds)
             frame_idx += 1
+            if realtime_playback and not is_live_camera:
+                if stop_event is not None and stop_event.is_set():
+                    break
 
     finally:
         capture.release()
         if writer is not None:
             writer.release()
 
-    total_time = time.time() - start_wall_time
+    total_time = time.perf_counter() - start_perf_time
     summary = pipeline.get_summary()
     summary.update({
         "total_frames": frame_idx,
