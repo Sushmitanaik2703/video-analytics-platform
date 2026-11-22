@@ -364,7 +364,6 @@ class IntrusionDetector:
                                 intruder.stationary_anchor = center_pt
                                 intruder.stationary_since = timestamp
                                 intruder.is_stationary = False
-                                intruder.parking_violation = False
                                 intruder.dwell_duration = 0.0
                             else:
                                 # Vehicle remains stationary within threshold
@@ -400,6 +399,21 @@ class IntrusionDetector:
                                         }
                                         new_notifications.append(notif)
                                         self.event_log.append(notif)
+                                        self.incident_history.append({
+                                            "incident_id": len(self.incident_history) + 1,
+                                            "event": "PARKING_VIOLATION",
+                                            "type": "PARKING_VIOLATION",
+                                            "camera": self.camera_name,
+                                            "track_id": track_id,
+                                            "class_name": class_name,
+                                            "zone_name": zone.name,
+                                            "entry_time": intruder.first_detected_time_str or current_time_str,
+                                            "entry_timestamp": intruder.first_detected_time,
+                                            "exit_time": None,
+                                            "exit_timestamp": None,
+                                            "duration_seconds": None,
+                                            "status": "ACTIVE",
+                                        })
                                         print(f"  {notif['message']}", flush=True)
                         else:
                             if intruder.consecutive_frames >= self.confirm_frames:
@@ -534,7 +548,11 @@ class IntrusionDetector:
 
                 # Keep and update incident history record permanently
                 for inc in reversed(self.incident_history):
-                    if inc.get("track_id") == intruder_obj.track_id and inc.get("status") == "ACTIVE":
+                    if (
+                        inc.get("track_id") == intruder_obj.track_id
+                        and inc.get("zone_name") == intruder_obj.zone_name
+                        and inc.get("status") == "ACTIVE"
+                    ):
                         inc["status"] = "CLEARED"
                         inc["exit_time"] = exit_t_str
                         inc["exit_timestamp"] = exit_t
@@ -559,12 +577,16 @@ class IntrusionDetector:
                 # Temporary detection loss:
                 # The entity was completely missing from detections (e.g. occlusion, blur, temporary miss).
                 intruder.lost_frames += 1
-                if intruder.lost_frames > self.max_lost_frames:
+                keep_vehicle_alert = (
+                    intruder.confirmed
+                    and intruder.class_name in VEHICLE_CLASSES
+                )
+                if intruder.lost_frames > self.max_lost_frames and not keep_vehicle_alert:
                     # Grace period expired: entity disappeared from camera view
                     _record_zone_exit(intruder, intruder.last_detected_time, current_time_str)
                     del self.tracked_intruders[key]
                 else:
-                    # Entity is within grace period: preserve existing intrusion state
+                    # Preserve active state during missed detections; only an observed exit clears it.
                     if intruder.confirmed:
                         confirmed_intruders.append(intruder)
                         z_obj = next((z for z in self.zones if z.zone_id == intruder.zone_id), None)

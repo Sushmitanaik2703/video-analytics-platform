@@ -20,9 +20,8 @@ PERSON_CLASS_ID = 0
 BAG_CLASS_IDS = {24, 26, 28}
 TRACKED_CLASS_IDS = [PERSON_CLASS_ID, *sorted(BAG_CLASS_IDS)]
 TRACK_EXPIRY_SECONDS = 2.0
-OCCLUSION_GRACE_SECONDS = 5.0
+PICKUP_CONFIRMATION_FRAMES = 5
 MAX_CLASS_HISTORY = 30
-MIN_AREA_RATIO = 0.50
 
 
 def get_model_class_ids(model: YOLO) -> tuple[int, set[int], list[int]]:
@@ -62,6 +61,8 @@ class TrackedBag:
     associated_person_id: int | None = None
     last_alert_at: float | None = None
     alert_active: bool = False
+    alert_anchor: tuple[float, float] | None = None
+    pickup_motion_frames: int = 0
     last_seen_time: float = 0.0
     class_history: list[str] = field(default_factory=list)
     anchor_id: int = 0
@@ -78,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=Path,
         default=None,
-        help="Path to YOLO model checkpoint (default: yolov8s.pt if available, else yolov8n.pt)",
+        help="Path to YOLO model checkpoint (default: yolov8n.pt if available, else yolov8s.pt)",
     )
     parser.add_argument(
         "--confidence",
@@ -98,6 +99,12 @@ def parse_args() -> argparse.Namespace:
         default=640,
         choices=[640, 1280],
         help="YOLO inference image size: 640 (default) or 1280 (high-resolution)",
+    )
+    parser.add_argument(
+        "--frame-stride",
+        type=int,
+        default=3,
+        help="Run detection on every Nth frame for faster video processing (default: 3)",
     )
     parser.add_argument(
         "--stationary-time",
@@ -146,6 +153,8 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--{option.replace('_', '-')} must be between 0 and 1")
     if args.imgsz not in (640, 1280):
         parser.error(f"--imgsz must be either 640 or 1280, got {args.imgsz}")
+    if args.frame_stride < 1:
+        parser.error("--frame-stride must be at least 1")
     for option in (
         "stationary_time",
         "person_distance",
@@ -158,6 +167,18 @@ def parse_args() -> argparse.Namespace:
         parser.error("--save-interval must be greater than 0")
 
     return args
+
+
+def compute_box_iou(box1: tuple[int, int, int, int], box2: tuple[int, int, int, int]) -> float:
+    """Compute Intersection-over-Union (IoU) between two bounding boxes."""
+    xA = max(box1[0], box2[0])
+    yA = max(box1[1], box2[1])
+    xB = min(box1[2], box2[2])
+    yB = min(box1[3], box2[3])
+    inter_area = max(0, xB - xA) * max(0, yB - yA)
+    box1_area = max(1, (box1[2] - box1[0]) * (box1[3] - box1[1]))
+    box2_area = max(1, (box2[2] - box2[0]) * (box2[3] - box2[1]))
+    return float(inter_area / float(box1_area + box2_area - inter_area))
 
 
 def box_details(
@@ -182,46 +203,8 @@ def frame_timestamp(
     if previous_timestamp is None:
         return max(0.0, timestamp)
     if timestamp <= previous_timestamp:
-        timestamp = previous_timestamp + (1.0 / fps if fps > 0 else 1.0 / 30.0)
+        timestamp = previous_timestamp + (1.0 / fps if fps > 0 else 1.0 / 25.0)
     return timestamp
-
-
-def match_detection_to_anchor(
-    position: tuple[float, float],
-    bbox: tuple[int, int, int, int],
-    bags: dict[int, TrackedBag],
-    stationary_distance: float,
-    min_area_ratio: float = MIN_AREA_RATIO,
-) -> int | None:
-    det_w = max(1, bbox[2] - bbox[0])
-    det_h = max(1, bbox[3] - bbox[1])
-    det_area = float(det_w * det_h)
-
-    best_match_id = None
-    min_distance = float("inf")
-
-    for bag_id, bag in bags.items():
-        # Center-distance gate against the bag's stationary anchor
-        dist = (
-            (position[0] - bag.stationary_anchor[0]) ** 2
-            + (position[1] - bag.stationary_anchor[1]) ** 2
-        ) ** 0.5
-        if dist > stationary_distance:
-            continue
-
-        # Area-ratio gate
-        anchor_w = max(1, bag.bbox[2] - bag.bbox[0])
-        anchor_h = max(1, bag.bbox[3] - bag.bbox[1])
-        anchor_area = float(anchor_w * anchor_h)
-        area_ratio = min(det_area, anchor_area) / max(det_area, anchor_area)
-        if area_ratio < min_area_ratio:
-            continue
-
-        if dist < min_distance:
-            min_distance = dist
-            best_match_id = bag_id
-
-    return best_match_id
 
 
 def update_bag(
@@ -250,10 +233,27 @@ def update_bag(
         (position[0] - bag.stationary_anchor[0]) ** 2
         + (position[1] - bag.stationary_anchor[1]) ** 2
     ) ** 0.5
-    if movement > stationary_distance:
+    if bag.alert_active:
+        alert_anchor = bag.alert_anchor or bag.stationary_anchor
+        alert_movement = (
+            (position[0] - alert_anchor[0]) ** 2
+            + (position[1] - alert_anchor[1]) ** 2
+        ) ** 0.5
+        pickup_threshold = max(stationary_distance * 2.0, 50.0)
+        if alert_movement > pickup_threshold:
+            bag.pickup_motion_frames += 1
+        else:
+            bag.pickup_motion_frames = 0
+
+        if bag.pickup_motion_frames >= PICKUP_CONFIRMATION_FRAMES:
+            bag.alert_active = False
+            bag.alert_anchor = None
+            bag.pickup_motion_frames = 0
+            bag.stationary_anchor = position
+            bag.stationary_since = timestamp
+    elif movement > stationary_distance:
         bag.stationary_anchor = position
         bag.stationary_since = timestamp
-        bag.alert_active = False
 
     # Owner association: frozen once set; only associates if owner is currently unknown
     if bag.associated_person_id is None:
@@ -309,26 +309,38 @@ def process_frame(
     bags: dict[int, TrackedBag],
     args: argparse.Namespace,
     timestamp: float,
+    external_people: dict[int, TrackedPerson] | None = None,
+    skip_draw_people: bool = False,
+    pre_detected_boxes: object | None = None,
 ) -> object:
     person_cls_id, bag_cls_ids, tracked_cls_ids = get_model_class_ids(model)
     inference_confidence = min(args.confidence, args.bag_confidence)
-    results = model.track(
-        frame,
-        conf=inference_confidence,
-        classes=None if args.debug_detections else tracked_cls_ids,
-        imgsz=args.imgsz,
-        device=0 if torch.cuda.is_available() else "cpu",
-        persist=True,
-        tracker="bytetrack.yaml",
-        verbose=False,
-    )
-    result = results[0]
-    people: dict[int, TrackedPerson] = {}
+
+    if pre_detected_boxes is not None:
+        boxes = pre_detected_boxes
+        result_names = model.names
+    else:
+        # If external persons are already provided, infer only bag classes for speed
+        infer_classes = sorted(list(bag_cls_ids)) if external_people is not None else tracked_cls_ids
+        results = model.track(
+            frame,
+            conf=inference_confidence,
+            classes=None if args.debug_detections else infer_classes,
+            imgsz=args.imgsz,
+            device=0 if torch.cuda.is_available() else "cpu",
+            persist=True,
+            tracker="bytetrack.yaml",
+            verbose=False,
+        )
+        result = results[0]
+        boxes = result.boxes
+        result_names = result.names
+
+    people: dict[int, TrackedPerson] = dict(external_people) if external_people is not None else {}
     detected_bags: list[
-        tuple[int, str, tuple[int, int, int, int], tuple[float, float]]
+        tuple[int | None, str, tuple[int, int, int, int], tuple[float, float]]
     ] = []
 
-    boxes = result.boxes
     if args.debug_detections:
         print(f"t={timestamp:.2f}s result.boxes is None: {boxes is None}")
         print(
@@ -344,7 +356,7 @@ def process_frame(
         for index, box in enumerate(boxes):
             class_id, bbox, position = box_details(box)
             confidence = float(box.conf[0].item())
-            class_name = str(result.names[class_id])
+            class_name = str(result_names[class_id])
             track_id = int(track_ids[index]) if index < len(track_ids) else None
 
             if args.debug_detections:
@@ -360,63 +372,83 @@ def process_frame(
                     (255, 255, 0),
                 )
 
+            # Person detection (only populate if external_people was not supplied)
             if class_id == person_cls_id and confidence >= args.confidence:
-                if track_id is None:
-                    if not args.debug_detections:
-                        draw_box(frame, bbox, "person | ID unavailable", (255, 180, 0))
-                    continue
-                people[track_id] = TrackedPerson(track_id, position, bbox)
+                if external_people is None:
+                    if track_id is None:
+                        if not args.debug_detections and not skip_draw_people:
+                            draw_box(frame, bbox, "person | ID unavailable", (255, 180, 0))
+                        continue
+                    people[track_id] = TrackedPerson(track_id, position, bbox)
+
+            # Bag detection (backpack, handbag, suitcase)
             elif class_id in bag_cls_ids and confidence >= args.bag_confidence:
-                if track_id is None:
-                    if not args.debug_detections:
-                        draw_box(
-                            frame,
-                            bbox,
-                            f"{class_name} | ID unavailable",
-                            (0, 220, 0),
-                        )
+                # Filter out tiny noise slivers (e.g., width < 14 or height < 14)
+                bw = bbox[2] - bbox[0]
+                bh = bbox[3] - bbox[1]
+                if bw < 14 or bh < 14:
                     continue
                 detected_bags.append((track_id, class_name, bbox, position))
 
-    # Spatial Luggage Anchoring: bridge temporary track ID drops across brief occlusions
-    # Each incoming detected bag is mapped either to an existing spatial anchor or assigned a new anchor
-    claimed_anchor_keys: set[int] = set()
+    # --- Robust Spatial-Temporal Bag Association (Anchor-Based Stability) ---
+    # Maintains stable bag track IDs across consecutive frames even if ByteTrack drops or switches IDs
+    matched_bag_keys: set[int] = set()
+    next_bag_virtual_id = max(bags.keys(), default=0) + 1
 
-    for track_id, class_name, bbox, position in detected_bags:
-        matched_anchor_key: int | None = None
+    for raw_track_id, class_name, bbox, position in detected_bags:
+        matched_id: int | None = None
+        best_dist = float("inf")
 
-        # Case 1: Direct track ID match in active bags dictionary
-        if track_id in bags:
-            matched_anchor_key = track_id
-        else:
-            # Case 2: ByteTrack assigned a new track_id after occlusion/drop.
-            # Query the spatial anchor registry excluding anchors already claimed in this frame
-            available_anchors = {
-                k: v for k, v in bags.items() if k not in claimed_anchor_keys
-            }
-            matched_anchor_key = match_detection_to_anchor(
-                position,
+        # Priority 1: Match existing bag with identical ByteTrack track_id within spatial boundary
+        if raw_track_id is not None and raw_track_id in bags and raw_track_id not in matched_bag_keys:
+            dist = (
+                (position[0] - bags[raw_track_id].position[0]) ** 2
+                + (position[1] - bags[raw_track_id].position[1]) ** 2
+            ) ** 0.5
+            if bags[raw_track_id].alert_active or dist <= max(args.stationary_distance * 2.0, 50.0):
+                matched_id = raw_track_id
+                best_dist = dist
+
+        # Priority 2: Match by spatial proximity or IoU to an existing tracked bag
+        if matched_id is None:
+            for existing_id, existing_bag in bags.items():
+                if existing_id in matched_bag_keys:
+                    continue
+                iou = compute_box_iou(bbox, existing_bag.bbox)
+                dist = (
+                    (position[0] - existing_bag.position[0]) ** 2
+                    + (position[1] - existing_bag.position[1]) ** 2
+                ) ** 0.5
+                spatial_limit = (
+                    max(args.stationary_distance * 2.0, 50.0)
+                    if existing_bag.alert_active
+                    else max(args.stationary_distance * 1.5, 45.0)
+                )
+                if (dist <= spatial_limit or iou >= 0.20) and dist < best_dist:
+                    best_dist = dist
+                    matched_id = existing_id
+
+        # Update matched existing bag (preserves stable track ID and stationary_since)
+        if matched_id is not None:
+            matched_bag_keys.add(matched_id)
+            bag = bags[matched_id]
+            update_bag(
+                bag,
                 bbox,
-                available_anchors,
-                stationary_distance=args.stationary_distance,
-                min_area_ratio=MIN_AREA_RATIO,
+                position,
+                class_name,
+                timestamp,
+                args.person_distance,
+                args.stationary_distance,
+                people,
             )
-
-        if matched_anchor_key is not None:
-            bag = bags[matched_anchor_key]
-            claimed_anchor_keys.add(matched_anchor_key)
-
-            # If the ByteTrack track ID changed, migrate key to current track_id
-            if matched_anchor_key != track_id:
-                del bags[matched_anchor_key]
-                bag.track_id = track_id
-                bags[track_id] = bag
-                claimed_anchor_keys.discard(matched_anchor_key)
-                claimed_anchor_keys.add(track_id)
         else:
-            # Case 3: Completely new bag appearing at this location
+            # New bag: assign consistent ID
+            assigned_id = raw_track_id if (raw_track_id is not None and raw_track_id not in bags) else next_bag_virtual_id
+            if assigned_id == next_bag_virtual_id:
+                next_bag_virtual_id += 1
             bag = TrackedBag(
-                track_id=track_id,
+                track_id=assigned_id,
                 class_name=class_name,
                 bbox=bbox,
                 position=position,
@@ -426,28 +458,31 @@ def process_frame(
                 stationary_anchor=position,
                 last_seen_time=timestamp,
                 class_history=[class_name],
-                anchor_id=track_id,
+                anchor_id=assigned_id,
             )
-            bags[track_id] = bag
-            claimed_anchor_keys.add(track_id)
+            bags[assigned_id] = bag
+            matched_bag_keys.add(assigned_id)
+            update_bag(
+                bag,
+                bbox,
+                position,
+                class_name,
+                timestamp,
+                args.person_distance,
+                args.stationary_distance,
+                people,
+            )
 
-        update_bag(
-            bag,
-            bbox,
-            position,
-            class_name,
-            timestamp,
-            args.person_distance,
-            args.stationary_distance,
-            people,
-        )
-
-    # Prune anchors that have not been observed within OCCLUSION_GRACE_SECONDS (5.0s)
+    # Remove bag tracks that have not been detected for more than TRACK_EXPIRY_SECONDS (2.0s)
     for track_id in list(bags):
-        if timestamp - bags[track_id].last_seen_time > OCCLUSION_GRACE_SECONDS:
+        if (
+            timestamp - bags[track_id].last_seen_time > TRACK_EXPIRY_SECONDS
+            and not bags[track_id].alert_active
+        ):
             del bags[track_id]
 
-    if not args.debug_detections:
+    # Only draw people if skip_draw_people is False (prevents duplicate boxes)
+    if not args.debug_detections and not skip_draw_people:
         for person in people.values():
             draw_box(
                 frame,
@@ -459,51 +494,25 @@ def process_frame(
     warning_active = False
     for bag in bags.values():
         stationary_duration = max(0.0, timestamp - bag.stationary_since)
-        associated_person = people.get(bag.associated_person_id)
-        if associated_person is not None:
-            dist_to_owner = (
-                (associated_person.position[0] - bag.position[0]) ** 2
-                + (associated_person.position[1] - bag.position[1]) ** 2
+        person_moved_away = all(
+            (
+                (person.position[0] - bag.position[0]) ** 2
+                + (person.position[1] - bag.position[1]) ** 2
             ) ** 0.5
-            person_moved_away = dist_to_owner > args.person_distance
-        elif bag.associated_person_id is not None:
-            # Owner was previously identified but has now walked out of view/off-screen
-            # Verify no other person is currently standing directly beside the bag
-            min_dist_to_anyone = min(
-                [
-                    (
-                        (p.position[0] - bag.position[0]) ** 2
-                        + (p.position[1] - bag.position[1]) ** 2
-                    ) ** 0.5
-                    for p in people.values()
-                ],
-                default=float("inf"),
-            )
-            person_moved_away = min_dist_to_anyone > args.person_distance
-        else:
-            # Unclaimed bag standing alone with no associated person
-            min_dist_to_anyone = min(
-                [
-                    (
-                        (p.position[0] - bag.position[0]) ** 2
-                        + (p.position[1] - bag.position[1]) ** 2
-                    ) ** 0.5
-                    for p in people.values()
-                ],
-                default=float("inf"),
-            )
-            person_moved_away = min_dist_to_anyone > args.person_distance
+            > args.person_distance
+            for person in people.values()
+        )
         conditions_met = (
             stationary_duration >= args.stationary_time and person_moved_away
         )
-        if not conditions_met:
-            bag.alert_active = False
-        elif not bag.alert_active and (
+        if not bag.alert_active and conditions_met and (
             bag.last_alert_at is None
             or timestamp - bag.last_alert_at >= args.alert_cooldown
         ):
             bag.alert_active = True
             bag.last_alert_at = timestamp
+            bag.alert_anchor = bag.position
+            bag.pickup_motion_frames = 0
             play_alert_sound()
 
         warning_active = warning_active or bag.alert_active
@@ -560,9 +569,9 @@ def main() -> int:
     if args.model is not None:
         model_path = args.model.resolve()
     else:
-        candidate_s = Path(__file__).resolve().parent / "yolov8s.pt"
         candidate_n = Path(__file__).resolve().parent / "yolov8n.pt"
-        model_path = candidate_s if candidate_s.is_file() else candidate_n
+        candidate_s = Path(__file__).resolve().parent / "yolov8s.pt"
+        model_path = candidate_n if candidate_n.is_file() else candidate_s
 
     if not model_path.is_file():
         print(f"Error: YOLO model not found: {model_path}", file=sys.stderr)
@@ -613,6 +622,13 @@ def main() -> int:
                     exit_code = 1
                 break
 
+            current_frame_number = frame_number
+            frame_number += 1
+            if current_frame_number % args.frame_stride != 0:
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
+
             timestamp = frame_timestamp(
                 capture, args.webcam, previous_timestamp, fps
             )
@@ -626,7 +642,7 @@ def main() -> int:
             if args.save_frames is not None and (
                 next_save_time is None or timestamp >= next_save_time
             ):
-                output_path = args.save_frames / f"frame_{frame_number:06d}.jpg"
+                output_path = args.save_frames / f"frame_{current_frame_number:06d}.jpg"
                 if not cv2.imwrite(str(output_path), annotated_frame):
                     print(
                         f"Error: Could not save annotated frame: {output_path}",
@@ -638,7 +654,6 @@ def main() -> int:
             cv2.imshow("Smart CCTV - Unattended Object Detection", annotated_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-            frame_number += 1
     finally:
         capture.release()
         cv2.destroyAllWindows()

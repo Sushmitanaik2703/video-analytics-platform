@@ -16,7 +16,10 @@ A computer vision project for CCTV surveillance.
 
 Run `unattended_object.py` to detect people, backpacks, handbags, and suitcases.
 It uses the existing `yolov8n.pt` file in this folder and Ultralytics ByteTrack
-to maintain IDs across frames. It does not modify Member 1's `detect_objects.py`.
+to maintain IDs across frames. The faster YOLOv8n model is selected by default;
+use `--model yolov8s.pt` if you prefer the larger model. Inference uses CUDA
+when available and otherwise runs on the CPU. It does not modify Member 1's
+`detect_objects.py`.
 
 ### Install dependencies in PowerShell
 
@@ -40,7 +43,10 @@ py unattended_object.py --webcam
 py unattended_object.py --video "C:\path\to\sample.mp4"
 ```
 
-Press `q` to close the video window. The model runs on the CPU.
+Press `q` to close the video window.
+For faster processing, detection runs on every third frame by default. Change
+the sampling rate with `--frame-stride` (for example, `--frame-stride 4` for
+even faster processing or `--frame-stride 1` to process every frame).
 
 ### Detection settings
 
@@ -62,18 +68,17 @@ py unattended_object.py --video "C:\path\to\sample.mp4" --confidence 0.45 --stat
 3. If a person is within the configured pixel distance when a bag is observed,
    the closest person track is associated with that bag.
 4. The bag must stay within its stationary movement tolerance for the
-   stationary-time threshold. The associated person must also still be tracked
-   and be farther than the nearby-person distance before an alert can appear.
-5. The alert is latched while its conditions remain true and is rate-limited
-   by the cooldown if those conditions clear and later become true again.
+   stationary-time threshold, with no detected person within the configured
+   nearby-person distance. An owner does not have to be identified first.
+5. Once triggered, the red alert remains active if a person returns or the bag
+   is temporarily missed. It clears after significant movement is detected for
+   several consecutive frames; the cooldown rate-limits a later alert.
 
 “POSSIBLE UNATTENDED OBJECT” is a warning, not a determination that an item
 has been abandoned. Person-to-bag association is a simple nearest-center
 approximation; overlapping people, missed detections, occlusion, camera
-perspective, and tracking-ID changes can lead to missed or false alerts. In
-particular, the module does not treat a person disappearing from view as proof
-that they moved away. Test with consent-appropriate footage containing bags
-that are picked up, left stationary while their owner remains nearby, and left
-stationary while the associated person walks clearly away. Try different
-distances and camera views; this college-project prototype is not
-production-grade.
+perspective, and tracking-ID changes can lead to missed or false alerts. Test
+with consent-appropriate footage containing bags that are picked up, left
+stationary while a person remains nearby, and left stationary with no person
+nearby. Try different distances and camera views; this college-project
+prototype is not production-grade.
