@@ -1,0 +1,21 @@
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# YOLO model weights
+*.pt
+
+# Generated detection results
+runs/
+outputs/
+datasets/coco_subset/
+
+# Local test media
+bus.jpg
+*.mp4
+*.avi
