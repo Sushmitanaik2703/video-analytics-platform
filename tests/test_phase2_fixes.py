@@ -103,14 +103,14 @@ class TestPhase2Fixes(unittest.TestCase):
             "time_str": "12:00:25",
             "all_active_alerts": 1,
             "banner_level": "CRITICAL",
-            "banner_text": "🚨 CRITICAL ALERT ACTIVE: UNATTENDED BAG: Backpack #7",
+            "banner_text": "🚨 CRITICAL ALERT ACTIVE: UNATTENDED BAG: Backpack (Person #3)",
             "unattended_bags": [mock_bag],
             "confirmed_intruders": [],
             "notifications": [
                 {
                     "level": "CRITICAL",
                     "type": "UNATTENDED_BAG",
-                    "message": "Unattended Backpack #7 detected",
+                    "message": "Unattended Backpack detected (Person #3)",
                 }
             ],
         }
@@ -121,6 +121,7 @@ class TestPhase2Fixes(unittest.TestCase):
                 "type": "UNATTENDED_BAG",
                 "track_id": 7,
                 "class_name": "backpack",
+                "owner_id": 3,
                 "zone_name": "Full-Frame (Automatic)",
                 "entry_time": "12:00:25",
                 "exit_time": None,
@@ -141,9 +142,10 @@ class TestPhase2Fixes(unittest.TestCase):
         )
         root.update()
 
-        # Verify notification panel shows immediate alert with ID, duration, and ACTIVE status
+        # Verify notification panel shows the owner, duration, and ACTIVE status without a bag ID
         notif_text = app.lbl_notif_text.cget("text")
-        self.assertIn("#7", notif_text)
+        self.assertIn("Person #3", notif_text)
+        self.assertNotIn("#7", notif_text)
         self.assertIn("ACTIVE", notif_text)
         self.assertIn("Backpack", notif_text)
 
@@ -156,7 +158,7 @@ class TestPhase2Fixes(unittest.TestCase):
         self.assertEqual(len(children), 1)
         vals = app.tree.item(children[0])["values"]
         self.assertEqual(vals[1], "UNATTENDED_BAG")
-        self.assertEqual(vals[2], "#7")
+        self.assertEqual(vals[2], "Person #3")
         self.assertEqual(vals[8], "ACTIVE")
 
         root.destroy()

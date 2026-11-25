@@ -43,6 +43,30 @@ class FakeModel:
 
 
 class TestAlertLifecycleFixes(unittest.TestCase):
+    def test_previous_video_incidents_are_only_shown_in_full_audit(self):
+        app = SimpleNamespace(tree=Mock(), tree_audit=Mock())
+        app.tree.get_children.return_value = []
+        app.tree_audit.get_children.return_value = []
+        previous_incident = {
+            "incident_id": 1,
+            "type": "UNATTENDED_BAG",
+            "track_id": 7,
+            "class_name": "backpack",
+            "zone_name": "Full-Frame",
+            "entry_time": "00:00:10",
+            "status": "RESOLVED",
+            "duration_seconds": 5,
+        }
+
+        SmartCCTVApp._sync_incident_table(app, [], [previous_incident])
+
+        app.tree.insert.assert_not_called()
+        app.tree_audit.insert.assert_called_once()
+        self.assertEqual(
+            app.tree_audit.insert.call_args.kwargs["values"][1],
+            "UNATTENDED_BAG",
+        )
+
     def test_completed_video_keeps_unresolved_incident_active_in_ui(self):
         app = SimpleNamespace(
             btn_start=Mock(),
@@ -63,6 +87,8 @@ class TestAlertLifecycleFixes(unittest.TestCase):
             lbl_notif_title=Mock(),
             notif_panel=Mock(),
             _sync_incident_table=Mock(),
+            _set_current_incidents=Mock(),
+            _refresh_incident_dashboard=Mock(),
             success_color="#98c379",
         )
         results = {
@@ -79,7 +105,10 @@ class TestAlertLifecycleFixes(unittest.TestCase):
         with patch("cctv_app.messagebox.showinfo"):
             SmartCCTVApp._on_pipeline_completed(app, results, Path("annotated.mp4"))
 
-        app.kpi_active.val_lbl.config.assert_called_once_with(text="1")
+        app._refresh_incident_dashboard.assert_called_once_with(
+            active_alert_count=1,
+            fps=20.0,
+        )
         self.assertIn(
             "remain active",
             app.lbl_notif_text.config.call_args.kwargs["text"],
@@ -157,6 +186,41 @@ class TestAlertLifecycleFixes(unittest.TestCase):
             pre_detected_boxes=FakeBoxes([FakeBox(moved_box, 24)], [7]),
         )
         self.assertFalse(bags[7].alert_active)
+
+    def test_bag_alert_keeps_one_id_when_detector_track_id_changes(self):
+        model = FakeModel()
+        with patch("integrated_pipeline.YOLO", return_value=model):
+            pipeline = IntegratedPipeline(
+                yolo_model_path=Path("fake.pt"),
+                enable_intrusion=False,
+                enable_unattended_bag=True,
+                stationary_time=1.0,
+                person_distance=30.0,
+                stationary_distance=20.0,
+            )
+
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        for timestamp, detector_id in ((0.0, 7), (1.1, 22), (1.2, 23)):
+            model.detections = FakeBoxes(
+                [FakeBox((90, 90, 110, 110), 24)],
+                [detector_id],
+            )
+            _, status = pipeline.process_frame(frame, timestamp)
+
+        self.assertEqual(list(pipeline.unattended_bags), [7])
+        self.assertEqual(len(status["unattended_bags"]), 1)
+        self.assertEqual(status["unattended_bags"][0].track_id, 7)
+        self.assertNotIn("#7", status["banner_text"])
+        self.assertIn("Owner unknown", status["banner_text"])
+        self.assertEqual(len(pipeline.incident_history), 1)
+        self.assertEqual(
+            sum(
+                notification["type"] == "UNATTENDED_BAG"
+                for notification in pipeline.event_log
+            ),
+            1,
+        )
+        self.assertNotIn("#7", pipeline.event_log[0]["message"])
 
     def test_active_bag_remains_red_and_unresolved_when_detection_is_lost(self):
         args = SimpleNamespace(

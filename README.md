@@ -31,6 +31,15 @@ py -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
+### Incident database
+
+The desktop dashboard stores incidents in the local MongoDB Community Server,
+database `smart_cctv`, collection `incidents`. Install MongoDB Community Server
+and ensure its local service is running before starting the application.
+`pymongo` is installed with `requirements.txt`. Dashboard history loads
+asynchronously; if MongoDB is unavailable, detection and video playback continue
+and failed database operations are logged and retried.
+
 ### Run with the default webcam
 
 ```powershell

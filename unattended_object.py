@@ -517,21 +517,20 @@ def process_frame(
 
         warning_active = warning_active or bag.alert_active
         person_text = (
-            f"person {bag.associated_person_id}"
+            f"Person #{bag.associated_person_id}"
             if bag.associated_person_id is not None
-            else "person unknown"
+            else "Owner unknown"
         )
         if bag.alert_active:
             label = (
-                f"UNATTENDED BAG | ID: {bag.track_id} | "
-                f"{stationary_duration:.1f}s | "
-                f"pos ({int(bag.position[0])}, {int(bag.position[1])}) | {person_text}"
+                f"UNATTENDED BAG | {bag.class_name.capitalize()} | "
+                f"{stationary_duration:.1f}s | {person_text}"
             )
         else:
             label = (
-                f"{bag.class_name} ID {bag.track_id} | "
+                f"{bag.class_name.capitalize()} | "
                 f"{stationary_duration:.1f}s | "
-                f"pos ({int(bag.position[0])}, {int(bag.position[1])}) | {person_text}"
+                f"{person_text}"
             )
         draw_box(
             frame,

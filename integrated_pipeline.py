@@ -5,6 +5,7 @@ Orchestrates:
 1. Restricted-Zone Intrusion Detection (intrusion_detection.py)
 2. Vehicle Detection & Tracking (vehicle_tracking.py)
 3. Unattended-Bag Detection (unattended_object.py)
+4. Possible Physical Altercation Detection (fight-detection)
 
 Each feature can be toggled independently or combined seamlessly.
 Preserves all original detection logic, thresholds, and model weights without modification.
@@ -57,17 +58,52 @@ class IntegratedPipeline:
         alert_cooldown: float = 30.0,
         sched_mode: str = "auto",
         camera_name: str = "CCTV Camera",
+        enable_fight_detection: bool = False,
+        fight_confidence_threshold: float = 0.55,
+        fight_window_seconds: float = 5.0,
+        fight_stride_seconds: float = 1.0,
     ):
         self.camera_name = camera_name
         self.enable_intrusion = enable_intrusion
         self.enable_vehicle_tracking = enable_vehicle_tracking
         self.enable_unattended_bag = enable_unattended_bag
+        self.enable_fight_detection = enable_fight_detection
         self.zones = zones or []
         self.confidence = confidence
+        self.fight_confidence_threshold = fight_confidence_threshold
 
         self.incident_history: list[dict] = []
         self.event_log: list[dict] = []
         self._logged_bag_alert_ids: set[int] = set()
+        self.fight_detector = None
+        self._active_fight_incident: dict | None = None
+        self._fight_below_threshold_windows = 0
+        self._fight_clear_timestamp: float | None = None
+        self._fight_clear_time_str: str | None = None
+        self._fight_latest_probability: float | None = None
+        self._fight_latest_timestamp: float | None = None
+        self._fight_latest_time_str: str | None = None
+
+        if self.enable_fight_detection:
+            fight_source = str(
+                Path(__file__).resolve().parent / "fight-detection" / "src"
+            )
+            if fight_source not in sys.path:
+                sys.path.insert(0, fight_source)
+            from windowed_detector import WindowedFightDetector
+
+            model_path = (
+                Path(__file__).resolve().parent
+                / "fight-detection"
+                / "models"
+                / "fight_detection_final.pkl"
+            )
+            self.fight_detector = WindowedFightDetector(
+                model_path=model_path,
+                confidence_threshold=fight_confidence_threshold,
+                window_seconds=fight_window_seconds,
+                stride_seconds=fight_stride_seconds,
+            )
 
         # 1. Initialize Intrusion Detector if enabled
         self.intrusion_detector: IntrusionDetector | None = None
@@ -138,10 +174,13 @@ class IntegratedPipeline:
             "unattended_bags": [],
             "active_vehicles": [],
             "all_active_alerts": 0,
+            "possible_fight": False,
+            "fight_probability": getattr(self, "_fight_latest_probability", None),
+            "fight_timestamp": getattr(self, "_fight_latest_timestamp", None),
+            "fight_time_str": getattr(self, "_fight_latest_time_str", None),
             "banner_text": None,
             "banner_level": "NORMAL",
         }
-
         tracked_people: dict[int, uo.TrackedPerson] = {}
 
         # ------------------- 1. RESTRICTED-ZONE INTRUSION -------------------
@@ -215,7 +254,6 @@ class IntegratedPipeline:
 
                     print(f"\n[CRITICAL ALERT] UNATTENDED BAG DETECTED", flush=True)
                     print(f"Camera: {self.camera_name}", flush=True)
-                    print(f"Track ID: {bag.track_id}", flush=True)
                     print(f"Class: {bag.class_name.capitalize()}", flush=True)
                     print(f"Owner: {owner_text}", flush=True)
                     print(f"Stationary Dwell: {stationary_duration:.1f}s", flush=True)
@@ -229,7 +267,7 @@ class IntegratedPipeline:
                         "zone_name": "Full-Frame (Automatic)",
                         "timestamp": timestamp,
                         "time_str": current_time_str,
-                        "message": f"[UNATTENDED BAG ALERT] Critical! {bag.class_name.capitalize()} #{bag.track_id} stationary for {stationary_duration:.1f}s (owner: {owner_text}) at {current_time_str}.",
+                        "message": f"[UNATTENDED BAG ALERT] Critical! {bag.class_name.capitalize()} stationary for {stationary_duration:.1f}s (owner: {owner_text}) at {current_time_str}.",
                     }
                     status["notifications"].append(notif)
                     self.event_log.append(notif)
@@ -268,7 +306,6 @@ class IntegratedPipeline:
 
                         print(f"\n[ALERT RESOLVED] UNATTENDED BAG CLEARED", flush=True)
                         print(f"Camera: {self.camera_name}", flush=True)
-                        print(f"Track ID: {bag_id}", flush=True)
                         print(f"Resolution Time: {current_time_str}", flush=True)
                         print(f"Total Duration: {dur}s\n", flush=True)
 
@@ -283,10 +320,30 @@ class IntegratedPipeline:
                             "entry_time": inc.get("entry_time"),
                             "exit_time": current_time_str,
                             "duration_seconds": dur,
-                            "message": f"[BAG RESOLVED] Unattended bag #{bag_id} resolved at {current_time_str} ({dur}s).",
+                            "message": f"[BAG RESOLVED] Unattended bag resolved at {current_time_str} ({dur}s).",
                         }
                         status["notifications"].append(res_notif)
                         self.event_log.append(res_notif)
+
+        if (
+            getattr(self, "enable_fight_detection", False)
+            and getattr(self, "fight_detector", None) is not None
+        ):
+            prediction = self.fight_detector.process_frame(frame, timestamp)
+            if prediction is not None:
+                self._update_fight_incident(
+                    prediction,
+                    status,
+                    live_camera=live_camera,
+                )
+            status["possible_fight"] = getattr(
+                self,
+                "_active_fight_incident",
+                None,
+            ) is not None
+            status["fight_probability"] = self._fight_latest_probability
+            status["fight_timestamp"] = self._fight_latest_timestamp
+            status["fight_time_str"] = self._fight_latest_time_str
 
         # ------------------- 4. COMPOSITE BANNER & ALERTS -------------------
         alert_parts = []
@@ -295,14 +352,42 @@ class IntegratedPipeline:
             alert_parts.append(f"INTRUSION: {', '.join(int_summaries)}")
 
         if status.get("unattended_bags"):
-            bag_summaries = [f"{b.class_name.capitalize()} #{b.track_id}" for b in status["unattended_bags"]]
+            bag_summaries = [
+                f"{bag.class_name.capitalize()} (Person #{bag.associated_person_id})"
+                if bag.associated_person_id is not None
+                else f"{bag.class_name.capitalize()} (Owner unknown)"
+                for bag in status["unattended_bags"]
+            ]
             alert_parts.append(f"UNATTENDED BAG: {', '.join(bag_summaries)}")
 
-        status["all_active_alerts"] = len(status["confirmed_intruders"]) + len(status.get("unattended_bags", []))
+        if status["possible_fight"]:
+            probability = status.get("fight_probability") or 0.0
+            fight_time_str = status.get("fight_time_str") or "time unavailable"
+            alert_parts.append(
+                f"POSSIBLE PHYSICAL ALTERCATION ({probability:.0%}) at {fight_time_str}"
+            )
+
+        status["all_active_alerts"] = (
+            len(status["confirmed_intruders"])
+            + len(status.get("unattended_bags", []))
+            + int(status["possible_fight"])
+        )
 
         if alert_parts:
-            status["banner_level"] = "CRITICAL"
-            status["banner_text"] = "🚨 CRITICAL ALERT ACTIVE: " + " | ".join(alert_parts)
+            has_existing_critical = bool(
+                status["confirmed_intruders"] or status.get("unattended_bags")
+            )
+            if status["possible_fight"] and not has_existing_critical:
+                fight_time_str = status.get("fight_time_str") or "time unavailable"
+                status["banner_level"] = "WARNING"
+                status["banner_text"] = (
+                    f"⚠ POSSIBLE PHYSICAL ALTERCATION — "
+                    f"{(status.get('fight_probability') or 0.0):.0%} "
+                    f"at {fight_time_str} — HUMAN REVIEW REQUIRED"
+                )
+            else:
+                status["banner_level"] = "CRITICAL"
+                status["banner_text"] = "🚨 CRITICAL ALERT ACTIVE: " + " | ".join(alert_parts)
             # Draw prominent top alert banner on annotated frame
             cv2.rectangle(annotated, (0, 0), (annotated.shape[1], 44), (0, 0, 220), -1)
             cv2.putText(
@@ -320,6 +405,111 @@ class IntegratedPipeline:
 
         return annotated, status
 
+    def _update_fight_incident(
+        self,
+        prediction: dict,
+        status: dict,
+        live_camera: bool,
+    ) -> None:
+        timestamp = float(prediction["timestamp"])
+        probability = float(prediction["fight_probability"])
+        self._fight_latest_probability = probability
+        self._fight_latest_timestamp = timestamp
+        event_time = (
+            datetime.datetime.now().strftime("%H:%M:%S")
+            if live_camera
+            else format_video_timestamp(timestamp)
+        )
+        self._fight_latest_time_str = event_time
+
+        if probability >= self.fight_confidence_threshold:
+            self._fight_below_threshold_windows = 0
+            self._fight_clear_timestamp = None
+            self._fight_clear_time_str = None
+            if self._active_fight_incident is None:
+                incident = {
+                    "incident_id": len(self.incident_history) + 1,
+                    "event": "POSSIBLE_FIGHT",
+                    "type": "POSSIBLE_FIGHT",
+                    "camera": self.camera_name,
+                    "track_id": None,
+                    "class_name": "possible physical altercation",
+                    "zone_name": "Full frame",
+                    "entry_time": event_time,
+                    "entry_timestamp": timestamp,
+                    "exit_time": None,
+                    "exit_timestamp": None,
+                    "duration_seconds": 0.0,
+                    "status": "ACTIVE",
+                    "classification": "POSSIBLE",
+                    "fight_probability": probability,
+                }
+                self.incident_history.append(incident)
+                self._active_fight_incident = incident
+                notification = {
+                    "level": "WARNING",
+                    "type": "POSSIBLE_FIGHT",
+                    "timestamp": timestamp,
+                    "time_str": event_time,
+                    "fight_probability": probability,
+                    "message": (
+                        f"Possible physical altercation ({probability:.0%} fight "
+                        f"probability) at {event_time}. Human review required."
+                    ),
+                }
+                status["notifications"].append(notification)
+                self.event_log.append(notification)
+            else:
+                incident = self._active_fight_incident
+                incident["duration_seconds"] = round(
+                    max(0.0, timestamp - incident["entry_timestamp"]),
+                    1,
+                )
+                incident["fight_probability"] = probability
+                incident["max_fight_probability"] = max(
+                    probability,
+                    incident.get("max_fight_probability", probability),
+                )
+            return
+
+        if self._active_fight_incident is None:
+            return
+
+        self._fight_below_threshold_windows += 1
+        if self._fight_clear_timestamp is None:
+            self._fight_clear_timestamp = timestamp
+            self._fight_clear_time_str = event_time
+        if self._fight_below_threshold_windows < 2:
+            return
+
+        incident = self._active_fight_incident
+        exit_timestamp = self._fight_clear_timestamp
+        exit_time = self._fight_clear_time_str or event_time
+        incident["exit_time"] = exit_time
+        incident["exit_timestamp"] = exit_timestamp
+        incident["duration_seconds"] = round(
+            max(0.0, exit_timestamp - incident["entry_timestamp"]),
+            1,
+        )
+        incident["status"] = "RESOLVED"
+        notification = {
+            "level": "INFO",
+            "type": "FIGHT_SUSPICION_CLEARED",
+            "timestamp": exit_timestamp,
+            "time_str": exit_time,
+            "fight_probability": probability,
+            "message": (
+                f"Possible altercation signal cleared at {exit_time}; "
+                "this was not a confirmed fight."
+            ),
+        }
+        status["notifications"].append(notification)
+        self.event_log.append(notification)
+        self._active_fight_incident = None
+        self._fight_below_threshold_windows = 0
+        self._fight_clear_timestamp = None
+        self._fight_clear_time_str = None
+
     def get_incident_history(self) -> list[dict]:
         """Return full permanent incident audit log."""
         return list(self.incident_history)
@@ -330,11 +520,13 @@ class IntegratedPipeline:
         p_inc = sum(1 for x in self.incident_history if x.get("class_name") == "person" and x.get("type") != "UNATTENDED_BAG")
         v_inc = sum(1 for x in self.incident_history if x.get("class_name") in {"car", "motorcycle", "bus", "truck"})
         bag_inc = sum(1 for x in self.incident_history if x.get("type") == "UNATTENDED_BAG")
+        fight_inc = sum(1 for x in self.incident_history if x.get("type") == "POSSIBLE_FIGHT")
         return {
             "total_incidents": tot,
             "person_incidents": p_inc,
             "vehicle_incidents": v_inc,
             "unattended_bag_incidents": bag_inc,
+            "fight_incidents": fight_inc,
             "incident_history": list(self.incident_history),
         }
 
@@ -425,11 +617,23 @@ def process_integrated_stream(
                 last_terminal_time = now_wall
                 confirmed = status.get("confirmed_intruders", [])
                 bags = status.get("unattended_bags", [])
+                fight_probability = status.get("fight_probability")
+                if fight_probability is not None:
+                    print(
+                        f"[VIDEO {time_disp}] Fight model probability: "
+                        f"{fight_probability:.1%}",
+                        flush=True,
+                    )
                 if confirmed:
                     intr_strs = [f"{i.class_name.capitalize()} #{i.track_id}→'{i.zone_name}'" for i in confirmed]
                     print(f"[VIDEO {time_disp}] ⚠ INTRUSION ALERT: {', '.join(intr_strs)}", flush=True)
                 if bags:
-                    bag_strs = [f"{b.class_name.capitalize()} #{b.track_id}" for b in bags]
+                    bag_strs = [
+                        f"{bag.class_name.capitalize()} (Person #{bag.associated_person_id})"
+                        if bag.associated_person_id is not None
+                        else f"{bag.class_name.capitalize()} (Owner unknown)"
+                        for bag in bags
+                    ]
                     print(f"[VIDEO {time_disp}] ⚠ UNATTENDED BAG: {', '.join(bag_strs)}", flush=True)
             elif now_wall - last_terminal_time >= 10.0:
                 last_terminal_time = now_wall
@@ -452,6 +656,16 @@ def process_integrated_stream(
                     if key not in saved_alert_keys:
                         saved_alert_keys.add(key)
                         fname = f"unattended_bag_track{bag.track_id}_t{timestamp:.2f}s.jpg"
+                        out_p = screens_dir / fname
+                        cv2.imwrite(str(out_p), annotated_frame)
+                        saved_screenshot_paths.append(str(out_p))
+
+                if status.get("possible_fight"):
+                    key = f"fight_{timestamp:.2f}"
+                    if key not in saved_alert_keys:
+                        saved_alert_keys.add(key)
+                        probability = status.get("fight_probability") or 0.0
+                        fname = f"possible_fight_p{probability:.2f}_t{timestamp:.2f}s.jpg"
                         out_p = screens_dir / fname
                         cv2.imwrite(str(out_p), annotated_frame)
                         saved_screenshot_paths.append(str(out_p))

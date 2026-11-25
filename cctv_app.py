@@ -36,6 +36,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from intrusion_detection import IntrusionDetector, RestrictedZone, process_video_stream
 from integrated_pipeline import IntegratedPipeline, process_integrated_stream
+from incident_database import MongoIncidentService, serialize_incident
 
 
 class SmartCCTVApp:
@@ -90,14 +91,119 @@ class SmartCCTVApp:
         self.saved_screenshots: list[str] = []
         self.last_ui_draw_time = 0.0
         self._incident_table_signature: tuple | None = None
+        self._database_results: queue.Queue = queue.Queue()
+        self._incident_store = MongoIncidentService(self._database_results)
+        self._saved_incidents: dict[str, dict] = {}
+        self._current_incident_history: list[dict] = []
+        self._persistence_signatures: dict[str, str] = {}
 
         # Build UI Components
         self._build_header()
         self._build_body()
         self._build_statusbar()
 
+        self.root.bind("<Destroy>", self._on_root_destroy, add="+")
+        self._incident_store.load_incidents()
+        self.root.after(100, self._poll_database_results)
+
         # Check for pre-loaded samples
         self._populate_sample_videos()
+
+    def _on_root_destroy(self, event):
+        if event.widget is self.root:
+            self._incident_store.close()
+
+    def _poll_database_results(self):
+        try:
+            while True:
+                message_type, payload = self._database_results.get_nowait()
+                if message_type == "loaded":
+                    for incident in payload:
+                        incident_key = incident.get("incident_key")
+                        if incident_key:
+                            self._saved_incidents.setdefault(incident_key, incident)
+                    self._refresh_incident_dashboard()
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_database_results)
+
+    def _set_current_incidents(self, incident_history: list[dict]):
+        video_filename = self.video_path.name if self.video_path else None
+        current_incidents = []
+        for incident in incident_history:
+            current = dict(incident)
+            document = serialize_incident(current, video_filename)
+            if document is not None:
+                incident_key = document["incident_key"]
+                current["incident_key"] = incident_key
+                self._saved_incidents[incident_key] = current
+                signature = json.dumps(document, sort_keys=True, default=str)
+                if self._persistence_signatures.get(incident_key) != signature:
+                    self._incident_store.save_incident(document)
+                    self._persistence_signatures[incident_key] = signature
+            current_incidents.append(current)
+        self._current_incident_history = current_incidents
+
+    def _all_incidents(self) -> list[dict]:
+        incidents = dict(self._saved_incidents)
+        for incident in self._current_incident_history:
+            incident_key = incident.get("incident_key")
+            if incident_key:
+                incidents[incident_key] = incident
+        return list(incidents.values())
+
+    def _refresh_incident_dashboard(
+        self,
+        *,
+        active_alert_count: int | None = None,
+        fps: float | None = None,
+    ):
+        incidents = self._all_incidents()
+        vehicle_classes = {"car", "motorcycle", "bus", "truck"}
+        total_incidents = len(incidents)
+        person_incidents = sum(
+            1
+            for incident in incidents
+            if incident.get("class_name") == "person"
+            and incident.get("type") != "UNATTENDED_BAG"
+        )
+        vehicle_incidents = sum(
+            1
+            for incident in incidents
+            if incident.get("class_name") in vehicle_classes
+        )
+        bag_incidents = sum(
+            1 for incident in incidents if incident.get("type") == "UNATTENDED_BAG"
+        )
+
+        self.kpi_total.val_lbl.config(text=str(total_incidents))
+        self.kpi_person.val_lbl.config(text=str(person_incidents))
+        self.kpi_vehicle.val_lbl.config(text=str(vehicle_incidents))
+        self.kpi_bag.val_lbl.config(text=str(bag_incidents))
+        if active_alert_count is not None:
+            self.kpi_active.val_lbl.config(text=str(active_alert_count))
+        if fps is not None:
+            self.kpi_fps.val_lbl.config(text=f"{fps:.1f} FPS")
+
+        incident_signature = tuple(
+            (
+                incident.get("incident_key"),
+                incident.get("incident_id"),
+                incident.get("type"),
+                incident.get("track_id"),
+                incident.get("class_name"),
+                incident.get("zone_name"),
+                incident.get("entry_time"),
+                incident.get("exit_time"),
+                incident.get("duration_seconds"),
+                incident.get("status"),
+            )
+            for incident in incidents
+        )
+        if incident_signature != self._incident_table_signature:
+            self._sync_incident_table(self._current_incident_history, incidents)
+            self._incident_table_signature = incident_signature
+        return total_incidents, person_incidents, vehicle_incidents, bag_incidents
 
     def _setup_styles(self):
         style = ttk.Style(self.root)
@@ -223,18 +329,54 @@ class SmartCCTVApp:
         self.chk_feat_intrusion = tk.BooleanVar(value=True)
         self.chk_feat_vehicle = tk.BooleanVar(value=True)
         self.chk_feat_bag = tk.BooleanVar(value=True)
+        self.chk_feat_fight = tk.BooleanVar(value=False)
+        self.fight_threshold_var = tk.DoubleVar(value=0.55)
 
         self.chk_feat_intrusion.trace_add("write", lambda *args: self._on_feature_toggle())
         self.chk_feat_vehicle.trace_add("write", lambda *args: self._on_feature_toggle())
         self.chk_feat_bag.trace_add("write", lambda *args: self._on_feature_toggle())
+        self.chk_feat_fight.trace_add("write", lambda *args: self._on_feature_toggle())
 
         ttk.Checkbutton(sec_features, text="🚨 Restricted-Zone Intrusion Detection", variable=self.chk_feat_intrusion).pack(anchor="w", pady=2)
         ttk.Checkbutton(sec_features, text="🚗 Vehicle Detection & Tracking", variable=self.chk_feat_vehicle).pack(anchor="w", pady=2)
         ttk.Checkbutton(sec_features, text="💼 Unattended-Bag Detection (Automatic)", variable=self.chk_feat_bag).pack(anchor="w", pady=2)
+        ttk.Checkbutton(
+            sec_features,
+            text="🥊 Physical Altercation Detection",
+            variable=self.chk_feat_fight,
+        ).pack(anchor="w", pady=2)
+
+        fight_threshold_row = tk.Frame(sec_features, bg=self.panel_bg)
+        fight_threshold_row.pack(fill="x", pady=(5, 0))
+        tk.Label(
+            fight_threshold_row,
+            text="Possible-altercation threshold:",
+            font=("Segoe UI", 8),
+            fg=self.text_color,
+            bg=self.panel_bg,
+        ).pack(side="left")
+        self.lbl_fight_threshold_value = tk.Label(
+            fight_threshold_row,
+            text="55%",
+            font=("Segoe UI", 8, "bold"),
+            fg=self.text_bright,
+            bg=self.panel_bg,
+        )
+        self.lbl_fight_threshold_value.pack(side="right")
+        ttk.Scale(
+            sec_features,
+            from_=0.35,
+            to=0.95,
+            variable=self.fight_threshold_var,
+            command=self._on_fight_threshold_change,
+        ).pack(fill="x", pady=(1, 0))
 
         lbl_feat_note = tk.Label(
             sec_features,
-            text="💡 Unattended Bag & Vehicle Tracking run automatically across the full frame without requiring zone drawing.",
+            text=(
+                "💡 Bag and vehicle tracking run full-frame. Fight alerts show a "
+                "window-level possibility for human review; no individuals are identified."
+            ),
             font=("Segoe UI", 7, "italic"),
             fg=self.text_color,
             bg=self.panel_bg,
@@ -457,7 +599,7 @@ class SmartCCTVApp:
 
         self.tree.heading("id", text="#")
         self.tree.heading("type", text="Incident Type")
-        self.tree.heading("track_id", text="Track ID")
+        self.tree.heading("track_id", text="Person / Track")
         self.tree.heading("class", text="Class")
         self.tree.heading("zone", text="Zone")
         self.tree.heading("entry", text="Entry Time")
@@ -670,6 +812,16 @@ class SmartCCTVApp:
         self.canvas_img_id = None
         self._update_zones_listbox()
         self._clear_incident_table()
+        self.live_alert_banner.config(
+            text="● ALL RESTRICTED ZONES & AREAS SECURE — NO ACTIVE ALERTS",
+            bg="#1a2e22",
+            fg=self.success_color,
+        )
+        self.status_badge.config(
+            text="● READY",
+            fg=self.success_color,
+            bg="#1a2e22",
+        )
 
         # Switch to Monitor Tab
         self.notebook.select(self.tab_monitor)
@@ -680,15 +832,21 @@ class SmartCCTVApp:
         feat_intrusion = self.chk_feat_intrusion.get()
         feat_vehicle = self.chk_feat_vehicle.get()
         feat_bag = self.chk_feat_bag.get()
-        if not feat_intrusion and (feat_vehicle or feat_bag):
+        feat_fight = self.chk_feat_fight.get()
+        if not feat_intrusion and (feat_vehicle or feat_bag or feat_fight):
             active_names = []
             if feat_bag:
                 active_names.append("Unattended-Bag Detection")
             if feat_vehicle:
                 active_names.append("Vehicle Tracking")
+            if feat_fight:
+                active_names.append("Physical Altercation Detection")
             self.status_text.config(text=f"Restricted-Zone Intrusion disabled. {', '.join(active_names)} will run full-frame without requiring polygons.")
         elif feat_intrusion:
             self.status_text.config(text="Restricted-Zone Intrusion enabled. Draw polygon zone on video frame or use saved zones.")
+
+    def _on_fight_threshold_change(self, value: str):
+        self.lbl_fight_threshold_value.config(text=f"{float(value):.0%}")
 
     # ------------------- INTERACTIVE POLYGON DRAWING -------------------
     def on_canvas_click(self, event):
@@ -869,11 +1027,16 @@ class SmartCCTVApp:
         feat_intrusion = self.chk_feat_intrusion.get()
         feat_vehicle = self.chk_feat_vehicle.get()
         feat_bag = self.chk_feat_bag.get()
+        feat_fight = self.chk_feat_fight.get()
 
-        if not (feat_intrusion or feat_vehicle or feat_bag):
+        if not (feat_intrusion or feat_vehicle or feat_bag or feat_fight):
             messagebox.showwarning(
                 "No Feature Selected",
-                "Please select at least one AI monitoring feature:\n• Restricted-Zone Intrusion\n• Vehicle Detection & Tracking\n• Unattended-Bag Detection"
+                "Please select at least one AI monitoring feature:\n"
+                "• Restricted-Zone Intrusion\n"
+                "• Vehicle Detection & Tracking\n"
+                "• Unattended-Bag Detection\n"
+                "• Physical Altercation Detection"
             )
             return
 
@@ -885,7 +1048,10 @@ class SmartCCTVApp:
                 else:
                     messagebox.showwarning(
                         "No Restricted Zone Defined",
-                        "Restricted-Zone Intrusion Detection is enabled.\nPlease draw at least one zone polygon directly on the video frame and click 'Save Zone',\nor uncheck Restricted-Zone Intrusion to run unattended-bag or vehicle tracking full-frame."
+                        "Restricted-Zone Intrusion Detection is enabled.\n"
+                        "Please draw at least one zone polygon directly on the video frame "
+                        "and click 'Save Zone', or uncheck it to run the selected full-frame "
+                        "features without polygons."
                     )
                     return
 
@@ -901,7 +1067,7 @@ class SmartCCTVApp:
                 )
                 runtime_zones.append(rz)
         else:
-            # Full-frame Unattended Bag / Vehicle mode: No zone polygon required
+            # Full-frame features do not require a restricted-zone polygon.
             self.current_poly_pts = []
 
         out_dir = PROJECT_ROOT / "runs" / "user_uploads"
@@ -957,6 +1123,8 @@ class SmartCCTVApp:
             active_str.append("Vehicles")
         if feat_bag:
             active_str.append("Unattended Bags (Auto)")
+        if feat_fight:
+            active_str.append("Physical Altercation (Possible)")
         self.status_text.config(text=f"Processing {self.video_path.name} [{', '.join(active_str)}]...")
 
         self._clear_incident_table()
@@ -970,7 +1138,8 @@ class SmartCCTVApp:
         thread = threading.Thread(
             target=self._run_pipeline_thread,
             args=(
-                feat_intrusion, feat_vehicle, feat_bag,
+                feat_intrusion, feat_vehicle, feat_bag, feat_fight,
+                float(self.fight_threshold_var.get()),
                 runtime_zones, model_path, out_video_path, screens_dir,
                 conf, confirm_frames, sched_mode, stat_time, p_dist
             ),
@@ -1017,6 +1186,8 @@ class SmartCCTVApp:
         feat_intrusion: bool,
         feat_vehicle: bool,
         feat_bag: bool,
+        feat_fight: bool,
+        fight_threshold: float,
         zones: list[RestrictedZone],
         model_path: Path,
         out_video_path: Path,
@@ -1031,7 +1202,11 @@ class SmartCCTVApp:
             print(f"\n=======================================================")
             print(f"[Smart CCTV App] Initializing integrated pipeline on: {self.video_path.name}")
             print(f"[Smart CCTV App] Model: {model_path.name} | Conf: {conf:.2f}")
-            print(f"[Smart CCTV App] Features: Intrusion={feat_intrusion}, Vehicles={feat_vehicle}, UnattendedBag={feat_bag}")
+            print(
+                f"[Smart CCTV App] Features: Intrusion={feat_intrusion}, "
+                f"Vehicles={feat_vehicle}, UnattendedBag={feat_bag}, "
+                f"PossibleFight={feat_fight}"
+            )
             print(f"=======================================================\n")
 
             pipeline = IntegratedPipeline(
@@ -1049,6 +1224,8 @@ class SmartCCTVApp:
                 alert_cooldown=30.0,
                 sched_mode=sched_mode,
                 camera_name=f"{self.video_path.stem.replace('_', ' ').title()} CCTV",
+                enable_fight_detection=feat_fight,
+                fight_confidence_threshold=fight_threshold,
             )
 
             last_terminal_print_time = [0.0]
@@ -1077,7 +1254,12 @@ class SmartCCTVApp:
                         intr_strs = [f"{i.class_name.capitalize()} #{i.track_id} → '{i.zone_name}'" for i in confirmed]
                         print(f"  [VIDEO {time_disp}] Frame {f_idx:5d} | ⚠ ALERT: {', '.join(intr_strs)}", flush=True)
                     if bags:
-                        bag_strs = [f"{b.class_name.capitalize()} #{b.track_id}" for b in bags]
+                        bag_strs = [
+                            f"{b.class_name.capitalize()} (Person #{b.associated_person_id})"
+                            if b.associated_person_id is not None
+                            else f"{b.class_name.capitalize()} (Owner unknown)"
+                            for b in bags
+                        ]
                         print(f"  [VIDEO {time_disp}] Frame {f_idx:5d} | ⚠ UNATTENDED BAG: {', '.join(bag_strs)}", flush=True)
                 elif now - last_terminal_print_time[0] >= 5.0:
                     last_terminal_print_time[0] = now
@@ -1129,9 +1311,25 @@ class SmartCCTVApp:
         alert_count = status.get("all_active_alerts", 0)
         banner_text = status.get("banner_text")
         banner_level = status.get("banner_level", "NORMAL")
+        active_bags = status.get("unattended_bags", [])
 
         # 2. Live Security Alert Banner
-        if banner_level == "CRITICAL" or alert_count > 0:
+        if (
+            status.get("possible_fight")
+            and not status.get("confirmed_intruders")
+            and not active_bags
+        ):
+            self.live_alert_banner.config(
+                text=banner_text or "⚠ POSSIBLE PHYSICAL ALTERCATION — HUMAN REVIEW REQUIRED",
+                bg="#8a1c24",
+                fg="#ffffff",
+            )
+            self.status_badge.config(
+                text="⚠ POSSIBLE FIGHT",
+                fg="#ff6b6b",
+                bg="#3d1416",
+            )
+        elif banner_level == "CRITICAL" or alert_count > 0:
             self.live_alert_banner.config(
                 text=banner_text or f"🚨 CRITICAL ALERT ACTIVE ({alert_count} active)",
                 bg="#8a1c24",
@@ -1155,30 +1353,34 @@ class SmartCCTVApp:
             self._display_frame_on_canvas(frame_bgr)
 
         # 4. Live KPI Cards
-        VEHICLE_CLASSES = {"car", "motorcycle", "bus", "truck"}
-        tot_inc = len(incident_history)
-        p_inc = sum(1 for inc in incident_history if inc.get("class_name") == "person" and inc.get("type") != "UNATTENDED_BAG")
-        v_inc = sum(1 for inc in incident_history if inc.get("class_name") in VEHICLE_CLASSES)
-        b_inc = sum(1 for inc in incident_history if inc.get("type") == "UNATTENDED_BAG")
-
-        self.kpi_total.val_lbl.config(text=str(tot_inc))
-        self.kpi_person.val_lbl.config(text=str(p_inc))
-        self.kpi_vehicle.val_lbl.config(text=str(v_inc))
-        self.kpi_bag.val_lbl.config(text=str(b_inc))
-        self.kpi_active.val_lbl.config(text=str(alert_count))
-        self.kpi_fps.val_lbl.config(text=f"{cur_fps:.1f} FPS")
+        self._set_current_incidents(incident_history)
+        self._refresh_incident_dashboard(
+            active_alert_count=alert_count,
+            fps=cur_fps,
+        )
 
         # 5. Dedicated Security Notification Panel (Below Video)
         unattended_bags = status.get("unattended_bags", [])
         active_bag_alerts = [b for b in unattended_bags if getattr(b, "alert_active", False)]
         notifications = status.get("notifications", [])
 
-        if active_bag_alerts:
+        if status.get("possible_fight"):
+            probability = status.get("fight_probability") or 0.0
+            fight_time = status.get("fight_time_str") or "--:--:--"
+            notif_msg = (
+                f"⚠ [POSSIBLE PHYSICAL ALTERCATION] {probability:.0%} fight "
+                f"probability at {fight_time} | HUMAN REVIEW REQUIRED — "
+                "individuals are not identified."
+            )
+            self.lbl_notif_text.config(text=notif_msg, fg="#ff6b6b", bg="#3d1416")
+            self.lbl_notif_title.config(fg="#ff6b6b", bg="#3d1416")
+            self.notif_panel.config(bg="#3d1416")
+        elif active_bag_alerts:
             first_bag = active_bag_alerts[0]
             dur = max(0.0, timestamp - getattr(first_bag, "stationary_since", timestamp))
             owner_info = f"Person #{first_bag.associated_person_id}" if getattr(first_bag, "associated_person_id", None) is not None else "Away / Unknown"
             notif_msg = (
-                f"🚨 [UNATTENDED BAG ALERT] {first_bag.class_name.capitalize()} #{first_bag.track_id} "
+                f"🚨 [UNATTENDED BAG ALERT] {first_bag.class_name.capitalize()} "
                 f"stationary for {dur:.1f}s (Owner: {owner_info}) at {status.get('time_str')} | Status: ACTIVE"
             )
             self.lbl_notif_text.config(text=notif_msg, fg="#ff6b6b", bg="#3d1416")
@@ -1202,29 +1404,24 @@ class SmartCCTVApp:
             self.lbl_notif_text.config(text=f"[{lvl}] {latest.get('message', '')}", fg=fg_col, bg=bg_col)
             self.lbl_notif_title.config(fg=fg_col, bg=bg_col)
             self.notif_panel.config(bg=bg_col)
+        elif status.get("fight_probability") is not None:
+            probability = status["fight_probability"]
+            fight_time = status.get("fight_time_str") or "--:--:--"
+            self.lbl_notif_text.config(
+                text=(
+                    f"Physical altercation model: {probability:.0%} at {fight_time} "
+                    f"(alert threshold {self.fight_threshold_var.get():.0%}). "
+                    "Below threshold; not a confirmed fight."
+                ),
+                fg=self.text_color,
+                bg="#1a1d24",
+            )
+            self.lbl_notif_title.config(fg="#61afef", bg="#1a1d24")
+            self.notif_panel.config(bg="#1a1d24")
         else:
             self.lbl_notif_text.config(text="● All restricted zones & areas secure — No active alerts.", fg=self.success_color, bg="#1a1d24")
             self.lbl_notif_title.config(fg="#61afef", bg="#1a1d24")
             self.notif_panel.config(bg="#1a1d24")
-
-        # 6. Live Incidents Table Synchronization
-        incident_signature = tuple(
-            (
-                incident.get("incident_id"),
-                incident.get("type"),
-                incident.get("track_id"),
-                incident.get("class_name"),
-                incident.get("zone_name"),
-                incident.get("entry_time"),
-                incident.get("exit_time"),
-                incident.get("duration_seconds"),
-                incident.get("status"),
-            )
-            for incident in incident_history
-        )
-        if incident_signature != self._incident_table_signature:
-            self._sync_incident_table(incident_history)
-            self._incident_table_signature = incident_signature
 
     def _display_frame_on_canvas(self, frame_bgr: np.ndarray):
         canvas_w = self.canvas.winfo_width()
@@ -1255,66 +1452,51 @@ class SmartCCTVApp:
             self.canvas.coords(self.canvas_img_id, offset_x, offset_y)
             self.canvas.itemconfig(self.canvas_img_id, image=self.live_photo)
 
-    def _sync_incident_table(self, incident_history: list[dict]):
-        existing_items = self.tree.get_children()
-        existing_count = len(existing_items)
+    def _sync_incident_table(
+        self,
+        live_incidents: list[dict],
+        audit_incidents: list[dict] | None = None,
+    ):
+        def sync_tree(tree, incidents: list[dict], live: bool = False) -> None:
+            existing_items = tree.get_children()
+            for i, inc in enumerate(incidents):
+                dur_str = (
+                    f"{inc['duration_seconds']}s"
+                    if inc.get("duration_seconds") is not None
+                    else "--"
+                )
+                displayed_track = f"#{inc.get('track_id')}"
+                if live and inc.get("type") == "UNATTENDED_BAG":
+                    owner_id = inc.get("owner_id")
+                    displayed_track = f"Person #{owner_id}" if owner_id is not None else "Unknown"
+                vals = (
+                    inc.get("incident_id", i + 1),
+                    inc.get("type", "INTRUSION"),
+                    "N/A" if inc.get("type") == "POSSIBLE_FIGHT" else displayed_track,
+                    inc.get("class_name", "person").capitalize(),
+                    inc.get("zone_name", "Zone"),
+                    inc.get("entry_time", "--"),
+                    inc.get("exit_time") or "--",
+                    dur_str,
+                    inc.get("status", "ACTIVE"),
+                )
+                if i < len(existing_items):
+                    tree.item(existing_items[i], values=vals)
+                else:
+                    tree.insert("", "end", values=vals)
+            for item_id in existing_items[len(incidents):]:
+                tree.delete(item_id)
 
-        for i, inc in enumerate(incident_history):
-            dur_str = f"{inc['duration_seconds']}s" if inc.get("duration_seconds") is not None else "--"
-            exit_str = inc.get("exit_time") or "--"
-            status_str = inc.get("status", "ACTIVE")
-
-            vals = (
-                inc.get("incident_id", i + 1),
-                inc.get("type", "INTRUSION"),
-                f"#{inc.get('track_id')}",
-                inc.get("class_name", "person").capitalize(),
-                inc.get("zone_name", "Zone"),
-                inc.get("entry_time", "--"),
-                exit_str,
-                dur_str,
-                status_str,
-            )
-
-            if i < existing_count:
-                item_id = existing_items[i]
-                self.tree.item(item_id, values=vals)
-            else:
-                self.tree.insert("", "end", values=vals)
-
-        # Also sync full audit tree on Tab 2
-        existing_audit = self.tree_audit.get_children()
-        for i, inc in enumerate(incident_history):
-            dur_str = f"{inc['duration_seconds']}s" if inc.get("duration_seconds") is not None else "--"
-            exit_str = inc.get("exit_time") or "--"
-            status_str = inc.get("status", "ACTIVE")
-            vals = (
-                inc.get("incident_id", i + 1),
-                inc.get("type", "INTRUSION"),
-                f"#{inc.get('track_id')}",
-                inc.get("class_name", "person").capitalize(),
-                inc.get("zone_name", "Zone"),
-                inc.get("entry_time", "--"),
-                exit_str,
-                dur_str,
-                status_str,
-            )
-            if i < len(existing_audit):
-                self.tree_audit.item(existing_audit[i], values=vals)
-            else:
-                self.tree_audit.insert("", "end", values=vals)
+        sync_tree(self.tree, live_incidents, live=True)
+        sync_tree(
+            self.tree_audit,
+            audit_incidents if audit_incidents is not None else live_incidents,
+        )
 
     def _clear_incident_table(self):
         self._incident_table_signature = None
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        for item in self.tree_audit.get_children():
-            self.tree_audit.delete(item)
-        self.kpi_total.val_lbl.config(text="0")
-        self.kpi_person.val_lbl.config(text="0")
-        self.kpi_vehicle.val_lbl.config(text="0")
-        self.kpi_bag.val_lbl.config(text="0")
-        self.kpi_active.val_lbl.config(text="0")
+        self._current_incident_history = []
+        self._refresh_incident_dashboard(active_alert_count=0)
         self.kpi_fps.val_lbl.config(text="-- FPS")
         if hasattr(self, "lbl_notif_text"):
             self.lbl_notif_text.config(
@@ -1343,39 +1525,37 @@ class SmartCCTVApp:
         # Populate Screenshots Gallery on Tab 2
         self._populate_screenshots_gallery()
 
-        tot_inc = results.get("total_incidents", 0)
-        p_inc = results.get("person_incidents", 0)
-        v_inc = results.get("vehicle_incidents", 0)
-        b_inc = results.get("unattended_bag_incidents", 0)
+        run_total_incidents = results.get("total_incidents", 0)
+        run_person_incidents = results.get("person_incidents", 0)
+        run_vehicle_incidents = results.get("vehicle_incidents", 0)
+        run_bag_incidents = results.get("unattended_bag_incidents", 0)
         final_history = results.get("incident_history", [])
+        self._set_current_incidents(final_history)
         active_alerts = sum(
             1 for incident in final_history
             if incident.get("status", "").upper() == "ACTIVE"
         )
 
-        # --- UPDATE KPI CARDS with final counts ---
-        self.kpi_total.val_lbl.config(text=str(tot_inc))
-        self.kpi_person.val_lbl.config(text=str(p_inc))
-        self.kpi_vehicle.val_lbl.config(text=str(v_inc))
-        self.kpi_bag.val_lbl.config(text=str(b_inc))
-        self.kpi_active.val_lbl.config(text=str(active_alerts))
+        # --- UPDATE KPI CARDS with saved and current incident counts ---
+        self._refresh_incident_dashboard(
+            active_alert_count=active_alerts,
+            fps=results.get("average_fps", 0.0),
+        )
         if active_alerts:
             self.status_badge.config(
                 text=f"🚨 {active_alerts} ACTIVE ALERTS",
                 fg="#ff6b6b",
                 bg="#3d1416",
             )
-        avg_fps = results.get("average_fps", 0.0)
-        self.kpi_fps.val_lbl.config(text=f"{avg_fps:.1f} FPS")
-
         # Update Notification Panel on completion
         if hasattr(self, "lbl_notif_text"):
             completion_message = (
-                f"● Detection complete: {tot_inc} incident(s) logged; "
+                f"● Detection complete: {run_total_incidents} incident(s) logged; "
                 f"{active_alerts} alert(s) remain active at the end of the video."
                 if active_alerts
-                else f"● Detection Complete: {tot_inc} incident(s) logged "
-                f"(Person: {p_inc}, Vehicle: {v_inc}, Bags: {b_inc})."
+                else f"● Detection Complete: {run_total_incidents} incident(s) logged "
+                f"(Person: {run_person_incidents}, Vehicle: {run_vehicle_incidents}, "
+                f"Bags: {run_bag_incidents})."
             )
             completion_color = "#ff6b6b" if active_alerts else self.success_color
             completion_bg = "#3d1416" if active_alerts else "#1a2e22"
@@ -1387,17 +1567,13 @@ class SmartCCTVApp:
             self.lbl_notif_title.config(fg=completion_color, bg=completion_bg)
             self.notif_panel.config(bg=completion_bg)
 
-        # --- UPDATE INCIDENT TABLE with final incident history ---
-        if final_history:
-            self._sync_incident_table(final_history)
-
         messagebox.showinfo(
             "Detection Complete",
             f"Video processing finished!\n\n"
-            f"• Total Incidents: {tot_inc}\n"
-            f"• Person Intrusions: {p_inc}\n"
-            f"• Vehicle Intrusions: {v_inc}\n"
-            f"• Unattended Bags: {b_inc}\n"
+            f"• Total Incidents: {run_total_incidents}\n"
+            f"• Person Intrusions: {run_person_incidents}\n"
+            f"• Vehicle Intrusions: {run_vehicle_incidents}\n"
+            f"• Unattended Bags: {run_bag_incidents}\n"
             f"• Output Video: {out_video_path.name}\n"
             f"• Event Screenshots: {len(self.saved_screenshots)} captured\n\n"
             f"Click 'Play Annotated Video' to watch the full playback."

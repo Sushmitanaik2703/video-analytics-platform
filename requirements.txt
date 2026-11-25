@@ -6,3 +6,7 @@ torch
 torchvision
 numpy
 Pillow
+pandas
+scikit-learn
+joblib
+pymongo
